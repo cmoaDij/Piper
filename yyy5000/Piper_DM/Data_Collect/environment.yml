@@ -1,0 +1,20 @@
+name: piper-capture
+channels:
+  - robostack-jazzy
+  - conda-forge
+dependencies:
+  - python=3.11
+  - numpy=1.26.4
+  - pinocchio=3.2.0
+  - casadi=3.6.7
+  - ros2-distro-mutex=0.7.0=jazzy_0
+  - ros-jazzy-ros-base
+  - ros-jazzy-tf2-ros
+  - ros-jazzy-launch-ros
+  - ros-jazzy-ament-cmake
+  - ros-jazzy-rosidl-default-generators
+  - colcon-common-extensions
+  - cmake<4
+  - ninja
+  - pip
+  - pkg-config

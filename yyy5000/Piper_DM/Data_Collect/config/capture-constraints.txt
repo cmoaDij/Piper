@@ -1,0 +1,11 @@
+numpy==1.26.4
+scipy==1.15.3
+casadi==3.6.7
+opencv-contrib-python==4.10.0.84
+protobuf>=4.25.3,<6
+grpcio-tools<1.72
+onnxruntime-gpu==1.22.0
+setuptools==79.0.1
+colcon-core==0.21.3
+colcon-notification==0.3.3
+av==15.1.0

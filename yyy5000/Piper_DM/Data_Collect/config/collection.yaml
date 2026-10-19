@@ -1,0 +1,73 @@
+# Paths are relative to Data_Collect, regardless of the caller's current directory.
+data_root: data
+task_instruction: "抓起物体并放到目标位置"
+operator: operator_01
+calibration_id: calibration_v1
+calibration_file: data/calibration/calibration_v1.json
+queue_max_items: 2048
+queue_max_mb: 256
+storage:
+  batch_ms: 50
+  batch_max_items: 128
+  video_encoder: auto  # 实测 NVENC 优先；不可用时回退 libx264
+  encoder_threads: 1
+  video_quality: 18  # NVENC CQ / libx264 CRF；数值越小质量越高
+feedback_hz: 200
+control_hz: 50
+command_timeout_s: 0.25
+gripper_max_m: 0.07
+camera_timeout_ms: 500
+arm_type: piper_x
+urdf: ros_ws/src/agx_arm_description/agx_arm_urdf/piper_x/urdf/piper_x_with_gripper_description.urdf
+base_link: base_link
+tip_link: link6
+tcp_offset: [0.0, 0.0, 0.113, 0.0, 0.0, 0.0]
+motion:
+  home_tolerance_rad: 0.0087266463
+  home_timeout_s: 45.0
+  fk_position_tolerance_m: 0.01
+  fk_rotation_tolerance_rad: 0.0872664626
+  feedback_skew_s: 0.025
+  stationary_duration_s: 0.25
+  stationary_tolerance_rad: 0.0087266463
+  first_target_tolerance_rad: 0.0523598776
+  max_target_step_rad: 0.0872664626
+  max_command_step_rad: 0.0034906585  # 每次下发最多 0.2°
+  max_velocity_rad_s: 0.0872664626  # 每轴最多 5°/s
+  max_acceleration_rad_s2: 0.2617993878  # 每轴最多 15°/s²
+  max_target_lead_rad: 0.0523598776  # 下发目标与实测位置最多相差 3°
+  feedback_motion_window_s: 0.1
+  max_feedback_window_travel_rad: 0.0349065850  # 每轴实测累计变化最多 2°/100 ms
+  max_feedback_step_rad: 0.0261799388  # 相邻真实反馈单包最多变化 1.5°
+  max_tracking_error_rad: 0.1745329252
+  max_control_gap_s: 0.06
+cameras:
+  global_rgb: {serial: "324422300699", width: 640, height: 480, fps: 30}
+  wrist_rgb: {serial: "140122074456", width: 640, height: 480, fps: 30}
+tactile:
+  left_raw: {dev_id: "X2631410795", backend: cpu, mode: standard, max_fps: 60, color_order: bgr}
+  right_raw: {dev_id: "X2631410810", backend: cpu, mode: standard, max_fps: 60, color_order: bgr}
+audit:
+  fps: 20
+  min_duration_s: 5
+  max_duration_s: 30
+  rgb_green_ms: 40
+  rgb_red_ms: 68
+  tactile_green_ms: 35
+  tactile_red_ms: 55
+  robot_red_ms: 25
+  tactile_skew_green_ms: 15
+  tactile_skew_red_ms: 25
+  max_yellow_ratio: 0.02
+  contact_window_s: 0.5
+  gripper_change_m: 0.001
+  open_threshold_m: 0.05
+  closed_threshold_m: 0.02
+  require_gripper_cycle: true
+  action_window_ms: 25
+  action_max_hold_ms: 100
+  stationary_joint_tolerance_rad: 0.003
+  stationary_gripper_tolerance_m: 0.001
+  stationary_lookback_s: 0.1
+  val_fraction: 0.2
+  split_seed: 42

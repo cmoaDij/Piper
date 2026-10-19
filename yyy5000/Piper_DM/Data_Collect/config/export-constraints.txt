@@ -1,0 +1,10 @@
+numpy==2.2.6
+torch==2.7.1+cpu
+torchvision==0.22.1+cpu
+torchcodec==0.4.0
+opencv-python-headless==4.11.0.86
+opencv-contrib-python==4.11.0.86
+datasets==4.0.0
+pyarrow==21.0.0
+lerobot==0.4.4
+av==15.1.0

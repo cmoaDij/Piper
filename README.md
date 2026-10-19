@@ -6,15 +6,13 @@
 
 ```text
 Piper/
-├── member1/        # 组员 1 的代码
-├── member2/        # 组员 2 的代码
-├── member3/        # 组员 3 的代码
-├── shared/         # 公共代码与共享资源
+├── yyy5000/        # yyy5000 的个人开发目录
+│   └── Piper_DM/   # 遥操作、数据采集工程、SDK 和文档
 ├── .gitignore
 └── README.md
 ```
 
-`member1`、`member2`、`member3` 是初始占位目录，可根据实际成员或模块重命名、扩展。目录划分是协作约定，**不是 GitHub 权限隔离**。
+当前代码统一位于 `yyy5000/Piper_DM/`，运行说明见 [个人目录说明](yyy5000/README.md)。其他成员后续可创建各自的个人目录。目录划分是协作约定，**不是 GitHub 权限隔离**。
 
 ## 协作约定
 

@@ -1,0 +1,11 @@
+recursive-include dmrobotics *.py
+
+recursive-include dmrobotics/lib *.so *.dll *.lib *.pyd *.seal
+
+recursive-include dmrobotics/lib/bundle_bins *.so *.dll *.pyd
+
+recursive-include Daimon *.so *.pyd *.dll *.dylib
+
+global-exclude *.pyc
+global-exclude *.pyo
+global-exclude __pycache__/
