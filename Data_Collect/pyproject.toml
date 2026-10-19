@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "piper-data-collect"
+version = "0.2.0"
+description = "Asynchronous Piper / dual RGB / Tac-X collection and causal audit"
+requires-python = ">=3.10"
+dependencies = ["numpy>=1.24,<3", "h5py>=3.8", "PyYAML>=6", "scipy>=1.10", "opencv-contrib-python>=4.6,<4.12", "av==15.1.0"]
+
+[project.optional-dependencies]
+hardware = ["pyrealsense2==2.56.5.9235", "python-can>=4,<5", "pure-python-adb==0.3.0.dev0", "casadi==3.6.7"]
+export = ["lerobot==0.4.4", "datasets==4.0.0", "pyarrow==21.0.0"]
+dev = ["pytest>=7,<9", "python-can>=4,<5", "typing-extensions>=4"]
+
+[project.scripts]
+piper-collect-gui = "data_collect.cli.gui:main"
+piper-collect-review = "data_collect.cli.review:main"
+piper-collect-export = "data_collect.cli.export:main"
+piper-collect-calibrate-latency = "data_collect.cli.calibrate_latency:main"
+
+[tool.setuptools.packages.find]
+include = ["data_collect*"]
+
+[tool.setuptools.package-data]
+"data_collect.web" = ["static/*.html", "static/*.css", "static/*.js", "static/vendor/*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = [".", "ros_ws/src/agx_arm_ctrl", "vendor/pyagxarm"]
+addopts = "-ra"
