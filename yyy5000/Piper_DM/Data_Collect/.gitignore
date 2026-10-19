@@ -1,0 +1,12 @@
+.venv/
+.runtime/
+__pycache__/
+logs/
+*.egg-info/
+ros_ws/build/
+ros_ws/install/
+ros_ws/log/
+data/**
+!data/**/
+!data/**/.gitkeep
+!data/calibration/example.json

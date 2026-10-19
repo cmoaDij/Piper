@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="control-token" content="__TOKEN__">
+<title>Piper · 遥操与采集工作台</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%2314b8a6'/%3E%3Cpath d='M8 24h16M12 24v-6l8-6-4-5' stroke='%230d1723' stroke-width='3' fill='none'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="/static/style.css">
+<script type="importmap">{"imports":{"three":"/static/vendor/three.module.js"}}</script>
+</head>
+<body>
+<aside class="sidebar">
+ <a class="brand" href="/"><svg viewBox="0 0 32 32"><path d="M7 26h19M11 26v-8l12-7-7-6M11 18l-4-4"/><circle cx="11" cy="18" r="3"/><circle cx="23" cy="11" r="3"/></svg><div>PIPER<span>TELEOP / DATA COLLECTION</span></div></a>
+ <div class="workspace"><span class="eyebrow">当前工作空间</span><strong>Piper-X <span class="muted">/ 六轴机械臂</span></strong><div class="tag">Data_Collect</div></div>
+ <div class="section-label">运行控制</div>
+ <label class="field">CAN 接口 <input id="can-port" value="can0" pattern="(?:v?can)[0-9]{1,3}" maxlength="7" spellcheck="false"></label>
+ <button id="start" class="primary"><span class="play-icon">▶</span> 启动遥操程序</button>
+ <button id="hold" class="warning" disabled>Ⅱ 停止运动 / 取消回零</button>
+ <button id="stop" class="secondary" disabled>■ 停止程序并保存</button>
+ <p class="control-note" id="control-note">启动会使能机械臂。<br>按手柄 <kbd>A</kbd> 回零对齐后开始运动；<kbd>B</kbd> 停止。</p>
+ <div class="section-label">传感器 <span id="sensor-count">0 / 4</span></div>
+ <div id="sensors" class="sensors"></div>
+ <div class="safety-card"><div class="section-label">遥操安全上限 <span>每轴</span></div><div><strong id="speed-limit">—</strong><small>速度</small></div><div><strong id="step-limit">—</strong><small>单次位置变化</small></div><p id="acceleration-limit">—</p><p>回零使用固件 5% 规划速度</p></div>
+ <div class="sidebar-bottom"><span class="dot" id="connection-dot"></span><span id="connection">连接界面服务中</span><span id="clock"></span></div>
+</aside>
+<main>
+ <header><div><div class="eyebrow">PIPER CONTROL STATION</div><h1>遥操与采集工作台</h1><p>实时姿态 · 关节跟随 · 采集状态</p></div><div class="header-right"><span id="mode-badge" class="badge">本机 / 实时监控</span><span id="phase" class="phase">未启动</span></div></header>
+ <div id="demo-banner" class="demo-banner" hidden>离线演示模式 · 所有状态均为模拟数据，不连接硬件、不保存轨迹</div>
+ <div id="alert" role="alert" class="alert" hidden></div>
+ <div class="top-grid">
+  <section class="panel viewport-panel"><div class="panel-heading"><h2><i class="dot teal"></i>机械臂三维视图 <span class="subtle">Piper-X / base_link</span></h2><div class="view-buttons"><button data-view="iso" class="active">透视</button><button data-view="front">正视</button><button data-view="top">俯视</button></div></div>
+   <div id="viewport"><div id="model-status" class="model-status">正在加载本地机械臂模型…</div><div class="view-legend"><span><i class="line white"></i>实测模型</span><label><input type="checkbox" id="show-target" checked><i class="line teal-line"></i>下发目标骨架</label><label><input type="checkbox" id="show-path" checked>TCP 轨迹</label></div><div class="view-help">左键旋转 · 滚轮缩放 · 右键平移 <span>单位 m · Z 向上</span></div><span id="pose-freshness" class="pose-freshness">无实时数据 · 零位预览</span></div>
+  </section>
+  <div class="inspector">
+   <section class="panel"><div class="panel-heading"><h2>运行状态</h2><span id="feedback-age" class="subtle">等待反馈</span></div><div class="process-summary"><span id="run-indicator" class="run-indicator"></span><div><strong id="run-title">等待启动</strong><small id="run-subtitle">界面就绪，机械臂尚未启动</small></div></div><div id="nodes" class="nodes"></div></section>
+   <section class="panel tcp-panel"><div class="panel-heading"><h2>末端 TCP</h2><span id="gripper" class="subtle">夹爪 — mm</span></div><div id="tcp-values" class="tcp-values"></div><div class="fk-row"><span>FK / SDK 位置差</span><strong id="fk-error">— mm</strong></div></section>
+  </div>
+ </div>
+ <section class="panel joints-panel"><div class="panel-heading"><h2>关节实时监测 <span class="subtle">实际值与已下发目标</span></h2><div class="legend"><span><i class="line white"></i>实际</span><span><i class="line teal-line"></i>目标</span><button id="clear-chart" class="text-button">清空曲线</button></div></div><div class="joints-grid"><div class="joint-table"><div class="joint-header"><span>关节 / 限位</span><span>实际 °</span><span>目标 °</span><span>速度 °/s</span><span>误差 °</span><span>最近 20 秒</span></div><div id="joints"></div></div><div class="chart-area"><div class="chart-toolbar"><div class="chart-tabs"><button data-chart="position" class="active">位置</button><button data-chart="velocity">速度</button><button data-chart="error">跟随误差</button></div><span id="chart-unit">°</span></div><canvas id="chart" aria-label="六个关节最近20秒的实时曲线"></canvas><div id="joint-legend" class="joint-legend"></div></div></div></section>
+ <section class="panel recording-panel"><div><span class="eyebrow">当前录制</span><strong id="episode">未录制</strong></div><div><small>时长</small><strong id="duration">00:00.0</strong></div><div class="queue-block"><small>写盘队列 <span id="queue-value">0 / 256 MiB</span></small><div class="queue-track"><div id="queue-fill"></div></div></div><span id="record-note" class="subtle">A 回零期间不录制</span></section>
+ <section class="panel logs-panel"><div class="panel-heading"><h2>进程日志 <span id="pid" class="subtle">尚无启动进程</span></h2><div class="log-actions"><label class="subtle"><input type="checkbox" id="log-errors">只看异常</label><label class="subtle"><input type="checkbox" id="log-follow" checked>自动滚动</label><button id="copy-log" class="text-button" title="复制当前日志视图，包含时间并遵循异常筛选；最多最近 500 条" disabled>复制日志</button><button id="clear-log" class="text-button">清空视图</button></div></div><div id="logs" role="log" aria-live="off"><div class="log-empty">启动后的进程输出会显示在这里，完整日志保存到 data/logs/gui/。</div></div></section>
+ <footer>仅观察 ROS 状态，GUI 不直接连接 CAN。关闭浏览器不停止程序；停止程序请使用按钮或在 GUI 终端按 Ctrl-C。软件停止不能替代硬件急停。</footer>
+</main>
+<div id="toast" role="status" hidden></div>
+<script type="module" src="/static/app.js"></script>
+</body></html>

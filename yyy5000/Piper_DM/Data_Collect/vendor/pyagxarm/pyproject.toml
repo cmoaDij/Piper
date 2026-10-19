@@ -1,0 +1,47 @@
+[build-system]
+requires = ["setuptools>=40.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pyAgxArm"
+dynamic = ["version"]
+description = "Python SDK for Agilex robotic arms"
+readme = { file = "README.md", content-type = "text/markdown" }
+authors = [
+    { name = "Agilex Robotics Co., Ltd." },
+]
+license = {text = "LGPL-3.0-only"}
+requires-python = ">=3.6"
+dependencies = [
+    "python-can>=3.3.4",
+    "typing-extensions>=3.7.4.3",
+]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.6",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: Microsoft :: Windows",
+    "Operating System :: MacOS :: MacOS X",
+]
+
+[project.urls]
+Homepage = "https://github.com/agilexrobotics/pyAgxArm"
+ChangeLog = "https://github.com/agilexrobotics/pyAgxArm/blob/master/CHANGELOG.md"
+
+[tool.setuptools.packages.find]
+include = [
+    "pyAgxArm",
+    "pyAgxArm.*",
+]
+
+[tool.setuptools.package-data]
+"*" = ["*.pyi"]
+"pyAgxArm" = [
+    "py.typed",
+]
+
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.dynamic]
+version = {attr = "pyAgxArm.version.__version__"}
