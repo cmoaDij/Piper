@@ -1,26 +1,26 @@
 # Piper
 
-多人协作开发仓库。
-
-## 目录结构
+Piper 遥操作与多传感器数据采集工程。全部采集代码、ROS 包、设备 SDK、模型、测试和运行说明位于 [`Data_Collect/`](Data_Collect/README.md)。
 
 ```text
 Piper/
-├── yyy5000/        # yyy5000 的个人开发目录
-│   └── Piper_DM/   # 遥操作、数据采集工程、SDK 和文档
+├── Data_Collect/    # 独立、分模块的数据采集工程
 ├── .gitignore
 └── README.md
 ```
 
-当前代码统一位于 `yyy5000/Piper_DM/`，运行说明见 [个人目录说明](yyy5000/README.md)。其他成员后续可创建各自的个人目录。目录划分是协作约定，**不是 GitHub 权限隔离**。
+## 开始使用
 
-## 协作约定
+```bash
+git clone https://github.com/cmoaDij/Piper.git
+cd Piper/Data_Collect
+# 按 Data_Collect/README.md 重建环境和 ROS overlay
+source env.sh
+python3 -m data_collect.cli.gui --demo --no-browser --port 8767
+```
 
-1. 首次使用：`git clone https://github.com/cmoaDij/Piper.git`。
-2. 开始任务前更新本地 `main`：`git switch main && git pull --ff-only origin main`。
-3. 每项任务从 `main` 新建分支：`git switch -c feat/用户名-任务名`。
-4. 只修改本人负责的目录；修改 `shared/` 或他人目录前先沟通。
-5. 提交本次任务相关文件，推送任务分支并创建 Pull Request，审核后合并到 `main`。
-6. 禁止强制推送、覆盖他人代码或提交密码、Token、API Key、`.env` 等敏感信息。
+当前采集使用 Piper-X + AGX 夹爪、Quest、双 RealSense 和双 Tac-X，同时保留旧版 Piper 模型。首次实机运行前须核对设备映射、标定与急停。
 
-> 建议仓库管理员为 `main` 配置分支保护，要求通过 Pull Request 合并。该规则需在 GitHub 设置中单独启用。
+## 协作
+
+每项任务从最新 main 创建功能分支，提交后创建面向 main 的 Pull Request，经审核后合并。PR 说明行为变化、验证结果及设备假设；界面变化附截图。禁止强制推送及提交设备密钥、密码、Token、`.env`、本地环境或真实采集数据。

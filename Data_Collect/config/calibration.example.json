@@ -1,0 +1,29 @@
+{
+  "schema_version": "piper_calibration_v1",
+  "calibration_id": "calibration_v1",
+  "verified": false,
+  "arm_type": "piper_x",
+  "camera_serials": {
+    "global_rgb": "324422300699",
+    "wrist_rgb": "140122074456"
+  },
+  "tactile_ids": {
+    "left_raw": "X2631410795",
+    "right_raw": "X2631410810"
+  },
+  "tcp_offset": [
+    0.0,
+    0.0,
+    0.113,
+    0.0,
+    0.0,
+    0.0
+  ],
+  "relative_offsets_ns": {
+    "global_rgb": 0,
+    "wrist_rgb": 0,
+    "left_raw": 0,
+    "right_raw": 0
+  },
+  "tracking_lag_notes": "未测量。请核对设备、TCP 和左右安装位置，完成现场标定后再设置 verified=true。"
+}
