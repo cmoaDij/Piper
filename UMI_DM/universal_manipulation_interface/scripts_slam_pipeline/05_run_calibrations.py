@@ -17,7 +17,8 @@ import subprocess
 # %%
 @click.command()
 @click.argument('session_dir', nargs=-1)
-def main(session_dir):
+@click.option('--nominal-z', type=float, default=0.072, show_default=True)
+def main(session_dir, nominal_z):
     script_dir = pathlib.Path(__file__).parent.parent.joinpath('scripts')
     
     for session in session_dir:
@@ -44,7 +45,7 @@ def main(session_dir):
             '--output', str(slam_tag_path),
             '--keyframe_only'
         ]
-        subprocess.run(cmd)
+        subprocess.run(cmd, check=True)
         
         # run gripper range calibration
         script_path = script_dir.joinpath('calibrate_gripper_range.py')
@@ -57,9 +58,10 @@ def main(session_dir):
             cmd = [
                 'python', str(script_path),
                 '--input', str(tag_path),
-                '--output', str(gripper_range_path)
+                '--output', str(gripper_range_path),
+                '--nominal_z', str(nominal_z)
             ]
-            subprocess.run(cmd)
+            subprocess.run(cmd, check=True)
 
             
 # %%

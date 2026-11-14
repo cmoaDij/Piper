@@ -37,8 +37,10 @@ class UmiDataset(BaseDataset):
         repeat_frame_prob: float=0.0,
         seed: int=42,
         val_ratio: float=0.0,
-        max_duration: Optional[float]=None
+        max_duration: Optional[float]=None,
+        normalizer_num_workers: int=32,
     ):
+        self.normalizer_num_workers = normalizer_num_workers
         self.pose_repr = pose_repr
         self.obs_pose_repr = self.pose_repr.get('obs_pose_repr', 'rel')
         self.action_pose_repr = self.pose_repr.get('action_pose_repr', 'rel')
@@ -199,7 +201,7 @@ class UmiDataset(BaseDataset):
         dataloader = torch.utils.data.DataLoader(
             dataset=self,
             batch_size=64,
-            num_workers=32,
+            num_workers=self.normalizer_num_workers,
         )
         for batch in tqdm(dataloader, desc='iterating dataset to get normalization'):
             for key in self.lowdim_keys:

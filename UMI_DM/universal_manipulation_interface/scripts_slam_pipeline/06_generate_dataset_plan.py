@@ -85,10 +85,12 @@ def get_x_projection(tx_tag_this, tx_tag_other):
 @click.option('-to', '--tcp_offset', type=float, default=0.205, help="Distance from gripper tip to mounting screw")
 @click.option('-ts', '--tx_slam_tag', default=None, help="tx_slam_tag.json")
 @click.option('-nz', '--nominal_z', type=float, default=0.072, help="nominal Z value for gripper finger tag")
+@click.option('--pose-cam-tcp', type=str, default=None, help='Camera-to-TCP pose x,y,z,rx,ry,rz in meters and radians')
+@click.option('--actual-gripper-range', type=str, default=None, help='Measured closed,open fingertip separation in meters')
 @click.option('-ml', '--min_episode_length', type=int, default=24)
 @click.option('--ignore_cameras', type=str, default=None, help="comma separated string of camera serials to ignore")
 def main(input, output, tcp_offset, tx_slam_tag,
-         nominal_z, min_episode_length, ignore_cameras):
+         nominal_z, pose_cam_tcp, actual_gripper_range, min_episode_length, ignore_cameras):
     # %% stage 0
     # gather inputs
     input_path = pathlib.Path(os.path.expanduser(input)).absolute()
@@ -104,7 +106,25 @@ def main(input, output, tcp_offset, tx_slam_tag,
     cam_to_mount_offset = 0.01465 # constant for GoPro Hero 9,10,11
     cam_to_tip_offset = cam_to_mount_offset + tcp_offset
 
-    pose_cam_tcp = np.array([0, cam_to_center_height, cam_to_tip_offset, 0,0,0])
+    if pose_cam_tcp is None:
+        pose_cam_tcp = np.array([0, cam_to_center_height, cam_to_tip_offset, 0,0,0])
+    else:
+        try:
+            pose_cam_tcp = np.array([float(x) for x in pose_cam_tcp.split(',')])
+        except ValueError as exc:
+            raise click.BadParameter('Expected six comma-separated numbers') from exc
+        if pose_cam_tcp.shape != (6,) or not np.isfinite(pose_cam_tcp).all():
+            raise click.BadParameter('Expected six finite values')
+    if actual_gripper_range is not None:
+        try:
+            actual_gripper_range = [float(x) for x in actual_gripper_range.split(',')]
+        except ValueError as exc:
+            raise click.BadParameter('Expected closed,open values') from exc
+        if (len(actual_gripper_range) != 2 or not np.isfinite(actual_gripper_range).all()
+                or actual_gripper_range[0] < 0 or actual_gripper_range[1] <= actual_gripper_range[0]):
+            raise click.BadParameter('Expected finite nonnegative closed < open values')
+    print('Camera-to-TCP pose:', pose_cam_tcp.tolist())
+    print('Actual gripper range:', actual_gripper_range)
     tx_cam_tcp = pose_to_mat(pose_cam_tcp)
         
     # SLAM map origin to table tag transform
@@ -134,7 +154,7 @@ def main(input, output, tcp_offset, tx_slam_tag,
             min_width = gripper_range_data['min_width']
             gripper_cal_data = {
                 'aruco_measured_width': [min_width, max_width],
-                'aruco_actual_width': [min_width, max_width]
+                'aruco_actual_width': actual_gripper_range if actual_gripper_range is not None else [min_width, max_width]
             }
             gripper_cal_interp = get_gripper_calibration_interpolator(**gripper_cal_data)
             gripper_id_gripper_cal_map[gripper_id] = gripper_cal_interp

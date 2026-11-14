@@ -72,8 +72,12 @@ def main(input, output, tag_det_threshold, nominal_z):
             width = float('Nan')
         gripper_widths.append(width)
     gripper_widths = np.array(gripper_widths)
+    if not np.isfinite(gripper_widths).any():
+        raise click.ClickException('No valid gripper widths; check nominal_z and detected marker depths')
     max_width = np.nanmax(gripper_widths)
     min_width = np.nanmin(gripper_widths)
+    if max_width <= min_width:
+        raise click.ClickException('Gripper width range is zero; calibration needs opening and closing motion')
 
     result = {
         'gripper_id': gripper_id,

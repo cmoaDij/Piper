@@ -19,7 +19,11 @@ import subprocess
 @click.command()
 @click.argument('session_dir', nargs=-1)
 @click.option('-c', '--calibration_dir', type=str, default=None)
-def main(session_dir, calibration_dir):
+@click.option('--config', type=click.Path(exists=True, dir_okay=False), default=None,
+              help='Configured pipeline YAML; otherwise use SESSION/calibration/pipeline.yaml if present')
+def main(session_dir, calibration_dir, config):
+    if not session_dir:
+        raise click.UsageError('Provide at least one session directory')
     script_dir = pathlib.Path(__file__).parent.joinpath('scripts_slam_pipeline')
     if calibration_dir is None:
         calibration_dir = pathlib.Path(__file__).parent.joinpath('example', 'calibration')
@@ -29,6 +33,15 @@ def main(session_dir, calibration_dir):
 
     for session in session_dir:
         session = pathlib.Path(os.path.expanduser(session)).absolute()
+        session_config = pathlib.Path(config).resolve() if config else session.joinpath('calibration', 'pipeline.yaml')
+        if session_config.is_file():
+            if calibration_dir != pathlib.Path(__file__).parent.joinpath('example', 'calibration'):
+                raise click.UsageError('Use calibration paths in pipeline.yaml instead of --calibration_dir')
+            from scripts_slam_pipeline.configured_pipeline import run_configured
+            run_configured(session, session_config)
+            continue
+        if config:
+            raise click.ClickException(f'Configuration not found: {session_config}')
 
         print("############## 00_process_videos #############")
         script_path = script_dir.joinpath("00_process_videos.py")

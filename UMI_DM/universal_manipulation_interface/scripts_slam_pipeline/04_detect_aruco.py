@@ -26,7 +26,8 @@ from tqdm import tqdm
 @click.option('-ci', '--camera_intrinsics', required=True, help='Camera intrinsics json file (2.7k)')
 @click.option('-ac', '--aruco_yaml', required=True, help='Aruco config yaml file')
 @click.option('-n', '--num_workers', type=int, default=None)
-def main(input_dir, camera_intrinsics, aruco_yaml, num_workers):
+@click.option('--no-mirror-mask', is_flag=True, help='Do not mask original mirror regions')
+def main(input_dir, camera_intrinsics, aruco_yaml, num_workers, no_mirror_mask):
     input_dir = pathlib.Path(os.path.expanduser(input_dir))
     input_video_dirs = [x.parent for x in input_dir.glob('*/raw_video.mp4')]
     print(f'Found {len(input_video_dirs)} video dirs')
@@ -43,6 +44,7 @@ def main(input_dir, camera_intrinsics, aruco_yaml, num_workers):
         # one chunk per thread, therefore no synchronization needed
         with concurrent.futures.ThreadPoolExecutor(max_workers=num_workers) as executor:
             futures = set()
+            all_futures = []
             for video_dir in tqdm(input_video_dirs):
                 video_dir = video_dir.absolute()
                 video_path = video_dir.joinpath('raw_video.mp4')
@@ -60,6 +62,8 @@ def main(input_dir, camera_intrinsics, aruco_yaml, num_workers):
                     '--aruco_yaml', aruco_yaml,
                     '--num_workers', '1'
                 ]
+                if no_mirror_mask:
+                    cmd.append('--no-mirror-mask')
 
                 if len(futures) >= num_workers:
                     # limit number of inflight tasks
@@ -67,17 +71,26 @@ def main(input_dir, camera_intrinsics, aruco_yaml, num_workers):
                         return_when=concurrent.futures.FIRST_COMPLETED)
                     pbar.update(len(completed))
 
-                futures.add(executor.submit(
+                future = executor.submit(
                     lambda x: subprocess.run(x, 
                         capture_output=True), 
-                    cmd))
+                    cmd)
+                futures.add(future)
+                all_futures.append((future, video_dir))
                 # futures.add(executor.submit(lambda x: print(' '.join(x)), cmd))
 
             completed, futures = concurrent.futures.wait(futures)            
             pbar.update(len(completed))
 
     print("Done! Result:")
-    print([x.result() for x in completed])
+    for future, video_dir in all_futures:
+        result = future.result()
+        print(result.args, 'returncode', result.returncode)
+        if result.returncode != 0:
+            error = result.stderr.decode(errors='replace')[-4000:]
+            raise click.ClickException(f'ArUco detection failed for {video_dir}:\n{error}')
+        if not video_dir.joinpath('tag_detection.pkl').is_file():
+            raise click.ClickException(f'ArUco detection did not write output for {video_dir}')
 
 # %%
 if __name__ == "__main__":
