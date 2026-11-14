@@ -17,6 +17,10 @@ import multiprocessing
 import concurrent.futures
 from tqdm import tqdm
 
+def run_extraction(cmd, video_dir, stdout_path, stderr_path):
+    with stdout_path.open('w') as stdout, stderr_path.open('w') as stderr:
+        return subprocess.run(cmd, cwd=str(video_dir), stdout=stdout, stderr=stderr)
+
 # %%
 @click.command()
 @click.option('-d', '--docker_image', default="chicheng/openicc:latest")
@@ -49,6 +53,7 @@ def main(docker_image, num_workers, no_docker_pull, session_dir):
             # one chunk per thread, therefore no synchronization needed
             with concurrent.futures.ThreadPoolExecutor(max_workers=num_workers) as executor:
                 futures = set()
+                all_futures = []
                 for video_dir in tqdm(input_video_dirs):
                     video_dir = video_dir.absolute()
                     if video_dir.joinpath('imu_data.json').is_file():
@@ -81,19 +86,20 @@ def main(docker_image, num_workers, no_docker_pull, session_dir):
                             return_when=concurrent.futures.FIRST_COMPLETED)
                         pbar.update(len(completed))
 
-                    futures.add(executor.submit(
-                        lambda x, stdo, stde: subprocess.run(x, 
-                            cwd=str(video_dir),
-                            stdout=stdo.open('w'),
-                            stderr=stde.open('w')), 
-                        cmd, stdout_path, stderr_path))
+                    future = executor.submit(run_extraction, cmd, video_dir, stdout_path, stderr_path)
+                    futures.add(future)
+                    all_futures.append((future, video_dir))
                     # print(' '.join(cmd))
 
                 completed, futures = concurrent.futures.wait(futures)
                 pbar.update(len(completed))
 
         print("Done! Result:")
-        print([x.result() for x in completed])
+        for future, video_dir in all_futures:
+            result = future.result()
+            print(result)
+            if result.returncode != 0 or not video_dir.joinpath('imu_data.json').is_file():
+                raise click.ClickException(f'IMU extraction failed for {video_dir}; inspect extract_gopro_imu_stderr.txt')
 
 # %%
 if __name__ == "__main__":

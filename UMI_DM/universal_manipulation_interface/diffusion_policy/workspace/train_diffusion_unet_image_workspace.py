@@ -133,6 +133,13 @@ class TrainDiffusionUnetImageWorkspace(BaseWorkspace):
             self.ema_model.set_normalizer(normalizer)
 
         # configure lr scheduler
+        # Checkpoints intentionally omit optimizer state.  When resuming, the
+        # optimizer is freshly constructed, so PyTorch needs its base learning
+        # rate explicitly provided before creating a scheduler with a nonzero
+        # last_epoch.
+        if cfg.training.resume:
+            for param_group in self.optimizer.param_groups:
+                param_group.setdefault('initial_lr', param_group['lr'])
         lr_scheduler = get_scheduler(
             cfg.training.lr_scheduler,
             optimizer=self.optimizer,
@@ -151,6 +158,10 @@ class TrainDiffusionUnetImageWorkspace(BaseWorkspace):
             ema = hydra.utils.instantiate(
                 cfg.ema,
                 model=self.ema_model)
+            # EMA advances once per training batch, as does global_step.
+            # Restore its warmup position when loading a checkpoint.
+            if cfg.training.resume:
+                ema.optimization_step = self.global_step
 
         # configure env
         env_runner: BaseImageRunner
@@ -207,7 +218,7 @@ class TrainDiffusionUnetImageWorkspace(BaseWorkspace):
         # training loop
         log_path = os.path.join(self.output_dir, 'logs.json.txt')
         with JsonLogger(log_path) as json_logger:
-            for local_epoch_idx in range(cfg.training.num_epochs):
+            for local_epoch_idx in range(self.epoch, cfg.training.num_epochs):
                 self.model.train()
 
                 step_log = dict()
@@ -302,10 +313,10 @@ class TrainDiffusionUnetImageWorkspace(BaseWorkspace):
                     B, T, _ = pred_action.shape
                     pred_action = pred_action.view(B, T, -1, 10)
                     gt_action = gt_action.view(B, T, -1, 10)
-                    step_log[f'{category}_action_mse_error'] = torch.nn.functional.mse_loss(pred_action, gt_action)
-                    step_log[f'{category}_action_mse_error_pos'] = torch.nn.functional.mse_loss(pred_action[..., :3], gt_action[..., :3])
-                    step_log[f'{category}_action_mse_error_rot'] = torch.nn.functional.mse_loss(pred_action[..., 3:9], gt_action[..., 3:9])
-                    step_log[f'{category}_action_mse_error_width'] = torch.nn.functional.mse_loss(pred_action[..., 9], gt_action[..., 9])
+                    step_log[f'{category}_action_mse_error'] = torch.nn.functional.mse_loss(pred_action, gt_action).item()
+                    step_log[f'{category}_action_mse_error_pos'] = torch.nn.functional.mse_loss(pred_action[..., :3], gt_action[..., :3]).item()
+                    step_log[f'{category}_action_mse_error_rot'] = torch.nn.functional.mse_loss(pred_action[..., 3:9], gt_action[..., 3:9]).item()
+                    step_log[f'{category}_action_mse_error_width'] = torch.nn.functional.mse_loss(pred_action[..., 9], gt_action[..., 9]).item()
                 # run diffusion sampling on a training batch
                 if (self.epoch % cfg.training.sample_every) == 0 and accelerator.is_main_process:
                     with torch.no_grad():
@@ -327,12 +338,17 @@ class TrainDiffusionUnetImageWorkspace(BaseWorkspace):
                         del pred_action
                 
                 # checkpoint
-                if (self.epoch % cfg.training.checkpoint_every) == 0 and accelerator.is_main_process:
+                if ((self.epoch % cfg.training.checkpoint_every) == 0
+                        or self.epoch == cfg.training.num_epochs - 1) and accelerator.is_main_process:
                     # unwrap the model to save ckpt
                     model_ddp = self.model
                     self.model = accelerator.unwrap_model(self.model)
 
                     # checkpointing
+                    # Save the next epoch/step so a resumed run does not
+                    # repeat the epoch that has already completed.
+                    self.epoch += 1
+                    self.global_step += 1
                     if cfg.checkpoint.save_last_ckpt:
                         self.save_checkpoint()
                     if cfg.checkpoint.save_last_snapshot:
@@ -353,6 +369,8 @@ class TrainDiffusionUnetImageWorkspace(BaseWorkspace):
                         self.save_checkpoint(path=topk_ckpt_path)
 
                     # recover the DDP model
+                    self.epoch -= 1
+                    self.global_step -= 1
                     self.model = model_ddp
                 # ========= eval end for this epoch ==========
                 # end of epoch

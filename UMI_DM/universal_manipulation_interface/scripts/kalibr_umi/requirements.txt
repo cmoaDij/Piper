@@ -1,0 +1,2 @@
+rosbags==0.9.23
+py-ubjson==0.16.1

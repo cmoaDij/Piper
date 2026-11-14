@@ -42,13 +42,33 @@ register_codecs()
 @click.option('-nm', '--no_mirror', is_flag=True, default=False, help="Disable mirror observation by masking them out")
 @click.option('-ms', '--mirror_swap', is_flag=True, default=False)
 @click.option('-n', '--num_workers', type=int, default=None)
+@click.option('--mask-polygon-json', type=click.Path(exists=True, dir_okay=False), default=None,
+              help='Fixed gripper mask polygon and reference_resolution as JSON')
+@click.option('--inpaint-tag-ids', default=None,
+              help='Comma-separated marker IDs to inpaint; default is all detected markers')
 def main(input, output, out_res, out_fov, compression_level, 
-         no_mirror, mirror_swap, num_workers):
+         no_mirror, mirror_swap, num_workers, mask_polygon_json, inpaint_tag_ids):
     if os.path.isfile(output):
         if click.confirm(f'Output file {output} exists! Overwrite?', abort=True):
             pass
         
     out_res = tuple(int(x) for x in out_res.split(','))
+    if inpaint_tag_ids is not None:
+        try:
+            inpaint_tag_ids = {int(x.strip()) for x in inpaint_tag_ids.split(',')}
+        except ValueError as exc:
+            raise click.BadParameter('Expected comma-separated integer marker IDs', param_hint='--inpaint-tag-ids') from exc
+    mask_spec = None
+    if mask_polygon_json is not None:
+        with open(mask_polygon_json) as f:
+            mask_spec = json.load(f)
+        resolution = mask_spec.get('reference_resolution')
+        points = np.asarray(mask_spec.get('polygon'), dtype=float)
+        if (not isinstance(resolution, list) or len(resolution) != 2
+                or points.ndim != 2 or points.shape[1] != 2 or len(points) < 3
+                or not np.isfinite(points).all()):
+            raise click.BadParameter('Expected reference_resolution [width,height] and polygon [[x,y],...]')
+        mask_spec = (tuple(resolution), np.rint(points).astype(np.int32))
 
     if num_workers is None:
         num_workers = multiprocessing.cpu_count()
@@ -215,13 +235,21 @@ def main(input, output, out_res, out_fov, compression_level,
 
                     # inpaint tags
                     this_det = tag_detection_results[frame_idx]
-                    all_corners = [x['corners'] for x in this_det['tag_dict'].values()]
+                    all_corners = [x['corners'] for tag_id, x in this_det['tag_dict'].items()
+                                   if inpaint_tag_ids is None or int(tag_id) in inpaint_tag_ids]
                     for corners in all_corners:
                         img = inpaint_tag(img, corners)
                         
                     # mask out gripper
-                    img = draw_predefined_mask(img, color=(0,0,0), 
-                        mirror=no_mirror, gripper=True, finger=False)
+                    if mask_spec is None:
+                        img = draw_predefined_mask(img, color=(0,0,0),
+                            mirror=no_mirror, gripper=True, finger=False)
+                    else:
+                        if (img.shape[1], img.shape[0]) != mask_spec[0]:
+                            raise ValueError(f'Video resolution {(img.shape[1], img.shape[0])} does not match mask reference {mask_spec[0]}')
+                        if no_mirror:
+                            img = draw_predefined_mask(img, color=(0,0,0), mirror=True, gripper=False, finger=False)
+                        cv2.fillPoly(img, [mask_spec[1]], (0,0,0))
                     # resize
                     if fisheye_converter is None:
                         img = resize_tf(img)
@@ -246,6 +274,7 @@ def main(input, output, out_res, out_fov, compression_level,
         # one chunk per thread, therefore no synchronization needed
         with concurrent.futures.ThreadPoolExecutor(max_workers=num_workers) as executor:
             futures = set()
+            all_futures = []
             for mp4_path, tasks in vid_args:
                 if len(futures) >= num_workers:
                     # limit number of inflight tasks
@@ -253,13 +282,14 @@ def main(input, output, out_res, out_fov, compression_level,
                         return_when=concurrent.futures.FIRST_COMPLETED)
                     pbar.update(len(completed))
 
-                futures.add(executor.submit(video_to_zarr, 
-                    out_replay_buffer, mp4_path, tasks))
+                future = executor.submit(video_to_zarr, out_replay_buffer, mp4_path, tasks)
+                futures.add(future)
+                all_futures.append(future)
 
             completed, futures = concurrent.futures.wait(futures)
             pbar.update(len(completed))
 
-    print([x.result() for x in completed])
+    print([future.result() for future in all_futures])
 
     # dump to disk
     print(f"Saving ReplayBuffer to {output}")

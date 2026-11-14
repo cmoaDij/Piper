@@ -31,7 +31,8 @@ from umi.common.cv_util import (
 @click.option('-ij', '--intrinsics_json', required=True)
 @click.option('-ay', '--aruco_yaml', required=True)
 @click.option('-n', '--num_workers', type=int, default=4)
-def main(input, output, intrinsics_json, aruco_yaml, num_workers):
+@click.option('--no-mirror-mask', is_flag=True, help='Do not mask the original UMI mirror regions')
+def main(input, output, intrinsics_json, aruco_yaml, num_workers, no_mirror_mask):
     cv2.setNumThreads(num_workers)
 
     # load aruco config
@@ -56,7 +57,7 @@ def main(input, output, intrinsics_json, aruco_yaml, num_workers):
             img = frame.to_ndarray(format='rgb24')
             frame_cts_sec = frame.pts * in_stream.time_base
             # avoid detecting tags in the mirror
-            img = draw_predefined_mask(img, color=(0,0,0), mirror=True, gripper=False, finger=False)
+            img = draw_predefined_mask(img, color=(0,0,0), mirror=not no_mirror_mask, gripper=False, finger=False)
             tag_dict = detect_localize_aruco_tags(
                 img=img,
                 aruco_dict=aruco_dict,

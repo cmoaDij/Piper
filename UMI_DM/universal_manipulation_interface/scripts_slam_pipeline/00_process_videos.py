@@ -39,13 +39,20 @@ def main(session_dir):
         if (not mapping_vid_path.exists()) and not(mapping_vid_path.is_symlink()):
             max_size = -1
             max_path = None
-            for mp4_path in list(input_dir.glob('**/*.MP4')) + list(input_dir.glob('**/*.mp4')):
-                size = mp4_path.stat().st_size
-                if size > max_size:
-                    max_size = size
-                    max_path = mp4_path
+            candidates = list(input_dir.glob('**/*.MP4')) + list(input_dir.glob('**/*.mp4'))
+            named_mapping = [p for p in candidates if p.parent == input_dir and p.name.lower() == 'mapping.mp4']
+            if named_mapping:
+                max_path = named_mapping[0]
+            else:
+                for mp4_path in candidates:
+                    size = mp4_path.stat().st_size
+                    if size > max_size:
+                        max_size = size
+                        max_path = mp4_path
+            if max_path is None:
+                raise click.ClickException(f'No MP4 videos found in {input_dir}')
             shutil.move(max_path, mapping_vid_path)
-            print(f"raw_videos/mapping.mp4 don't exist! Renaming largest file {max_path.name}.")
+            print(f"Using {max_path.name} as raw_videos/mapping.mp4.")
         
         # create gripper calibration video if don't exist
         gripper_cal_dir = input_dir.joinpath('gripper_calibration')

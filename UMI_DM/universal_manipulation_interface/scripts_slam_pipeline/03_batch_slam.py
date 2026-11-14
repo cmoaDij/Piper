@@ -44,10 +44,14 @@ def runner(cmd, cwd, stdout_path, stderr_path, timeout, **kwargs):
 @click.option('-ml', '--max_lost_frames', type=int, default=60)
 @click.option('-tm', '--timeout_multiple', type=float, default=16, help='timeout_multiple * duration = timeout')
 @click.option('-np', '--no_docker_pull', is_flag=True, default=False, help="pull docker image from docker hub")
-def main(input_dir, map_path, docker_image, num_workers, max_lost_frames, timeout_multiple, no_docker_pull):
+@click.option('--no-mirror-mask', is_flag=True, help='Do not mask original mirror regions')
+@click.option('--slam-setting', type=click.Path(exists=True, dir_okay=False), default=None)
+@click.option('--skip-mapping', is_flag=True, help='Only localize demonstration videos')
+def main(input_dir, map_path, docker_image, num_workers, max_lost_frames, timeout_multiple, no_docker_pull, no_mirror_mask, slam_setting, skip_mapping):
     input_dir = pathlib.Path(os.path.expanduser(input_dir)).absolute()
     input_video_dirs = [x.parent for x in input_dir.glob('demo*/raw_video.mp4')]
-    input_video_dirs += [x.parent for x in input_dir.glob('map*/raw_video.mp4')]
+    if not skip_mapping:
+        input_video_dirs += [x.parent for x in input_dir.glob('map*/raw_video.mp4')]
     print(f'Found {len(input_video_dirs)} video dirs')
     
     if map_path is None:
@@ -76,6 +80,7 @@ def main(input_dir, map_path, docker_image, num_workers, max_lost_frames, timeou
         # one chunk per thread, therefore no synchronization needed
         with concurrent.futures.ThreadPoolExecutor(max_workers=num_workers) as executor:
             futures = set()
+            all_futures = []
             for video_dir in tqdm(input_video_dirs):
                 video_dir = video_dir.absolute()
                 if video_dir.joinpath('camera_trajectory.csv').is_file():
@@ -98,30 +103,36 @@ def main(input_dir, map_path, docker_image, num_workers, max_lost_frames, timeou
                 
                 slam_mask = np.zeros((2028, 2704), dtype=np.uint8)
                 slam_mask = draw_predefined_mask(
-                    slam_mask, color=255, mirror=True, gripper=False, finger=True)
+                    slam_mask, color=255, mirror=not no_mirror_mask, gripper=False, finger=True)
                 cv2.imwrite(str(mask_write_path.absolute()), slam_mask)
 
                 map_mount_source = map_path
                 map_mount_target = pathlib.Path('/map').joinpath(map_mount_source.name)
 
                 # run SLAM
+                setting_path = '/ORB_SLAM3/Examples/Monocular-Inertial/gopro10_maxlens_fisheye_setting_v1_720.yaml'
                 cmd = [
                     'docker',
                     'run',
                     '--rm', # delete after finish
                     '--volume', str(video_dir) + ':' + '/data',
                     '--volume', str(map_mount_source.parent) + ':' + str(map_mount_target.parent),
+                ]
+                if slam_setting is not None:
+                    setting_path = '/umi_settings.yaml'
+                    cmd.extend(['--volume', str(pathlib.Path(slam_setting).resolve()) + ':' + setting_path + ':ro'])
+                cmd.extend([
                     docker_image,
                     '/ORB_SLAM3/Examples/Monocular-Inertial/gopro_slam',
                     '--vocabulary', '/ORB_SLAM3/Vocabulary/ORBvoc.txt',
-                    '--setting', '/ORB_SLAM3/Examples/Monocular-Inertial/gopro10_maxlens_fisheye_setting_v1_720.yaml',
+                    '--setting', setting_path,
                     '--input_video', str(video_path),
                     '--input_imu_json', str(json_path),
                     '--output_trajectory_csv', str(csv_path),
                     '--load_map', str(map_mount_target),
                     '--mask_img', str(mask_path),
                     '--max_lost_frames', str(max_lost_frames)
-                ]
+                ])
 
                 stdout_path = video_dir.joinpath('slam_stdout.txt')
                 stderr_path = video_dir.joinpath('slam_stderr.txt')
@@ -132,15 +143,22 @@ def main(input_dir, map_path, docker_image, num_workers, max_lost_frames, timeou
                         return_when=concurrent.futures.FIRST_COMPLETED)
                     pbar.update(len(completed))
 
-                futures.add(executor.submit(runner,
-                    cmd, str(video_dir), stdout_path, stderr_path, timeout))
+                future = executor.submit(runner, cmd, str(video_dir), stdout_path, stderr_path, timeout)
+                futures.add(future)
+                all_futures.append((future, video_dir))
                 # print(' '.join(cmd))
 
             completed, futures = concurrent.futures.wait(futures)
             pbar.update(len(completed))
 
     print("Done! Result:")
-    print([x.result() for x in completed])
+    for future, video_dir in all_futures:
+        result = future.result()
+        print(result)
+        if isinstance(result, subprocess.TimeoutExpired) or result.returncode != 0:
+            raise click.ClickException(f'SLAM failed for {video_dir}; inspect slam_stderr.txt')
+        if not video_dir.joinpath('camera_trajectory.csv').is_file():
+            raise click.ClickException(f'SLAM did not write a trajectory for {video_dir}')
 
 # %%
 if __name__ == "__main__":
