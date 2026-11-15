@@ -20,6 +20,10 @@ usage() {
   printf '  --match-dataset PATH 可选：训练 Zarr 数据集，启用训练首帧叠加\n'
   printf '  --match-episode N    初始参考片段编号，从 0 开始（页面可切换）\n'
   printf '  --match-alpha VALUE  训练图像透明度 0--1，默认 0.5（页面可调整）\n'
+  printf '  --future-waypoint    启用按延迟补偿选择未来路点（默认）\n'
+  printf '  --no-future-waypoint 固定使用预测序列第 0 个路点，便于 A/B 对比\n'
+  printf '  --future-waypoint-index N  固定使用预测序列第 N 个路点（0--15）\n'
+  printf '  --action-block-size N      每次连续执行 N 个路点后重新推理（1--16，默认 1）\n'
   printf '  秒数为 0 表示持续运行\n'
 }
 
@@ -45,6 +49,9 @@ record_dir=''
 match_dataset=''
 match_episode=0
 match_alpha=0.5
+future_waypoint_override=''
+future_waypoint_index_override=''
+action_block_size_override=1
 
 if [[ -z "$checkpoint" ]]; then
   if [[ -f "$workspace/train/current/checkpoints/latest.ckpt" ]]; then
@@ -75,11 +82,29 @@ while [[ $# -gt 0 ]]; do
     --match-dataset) [[ $# -ge 2 ]] || { usage >&2; exit 2; }; match_dataset=$2; shift 2 ;;
     --match-episode) [[ $# -ge 2 ]] || { usage >&2; exit 2; }; match_episode=$2; shift 2 ;;
     --match-alpha) [[ $# -ge 2 ]] || { usage >&2; exit 2; }; match_alpha=$2; shift 2 ;;
+    --future-waypoint) future_waypoint_override=--future-waypoint; shift ;;
+    --no-future-waypoint) future_waypoint_override=--no-future-waypoint; shift ;;
+    --future-waypoint-index)
+      [[ $# -ge 2 ]] || { usage >&2; exit 2; }
+      if [[ ! "$2" =~ ^[0-9]+$ || "$2" -gt 15 ]]; then
+        printf '未来路点索引必须是 0--15 的整数。\n' >&2; exit 2
+      fi
+      future_waypoint_index_override=$2; shift 2 ;;
+    --action-block-size)
+      [[ $# -ge 2 ]] || { usage >&2; exit 2; }
+      if [[ ! "$2" =~ ^[0-9]+$ || "$2" -lt 1 || "$2" -gt 16 ]]; then
+        printf '连续执行路点数必须是 1--16 的整数。\n' >&2; exit 2
+      fi
+      action_block_size_override=$2; shift 2 ;;
     *)
       if [[ "$1" =~ ^[0-9]+([.][0-9]+)?$ ]]; then duration=$1; shift
       else printf '未知参数：%s\n' "$1" >&2; usage >&2; exit 2; fi ;;
   esac
 done
+if [[ -n "$future_waypoint_index_override" && -n "$future_waypoint_override" ]]; then
+  printf '%s\n' '--future-waypoint-index 不能与 --future-waypoint/--no-future-waypoint 同时使用。' >&2
+  exit 2
+fi
 if [[ "$checkpoint_explicit" == 0 ]]; then
   if [[ -f "$workspace/train/current/checkpoints/latest.ckpt" ]]; then
     checkpoint=$workspace/train/current/checkpoints/latest.ckpt
@@ -155,6 +180,9 @@ record_dir: ${record_dir:-}
 match_dataset: ${match_dataset:-}
 match_episode: $match_episode
 match_alpha: $match_alpha
+future_waypoint_override: ${future_waypoint_override:-setup-default}
+future_waypoint_index_override: ${future_waypoint_index_override:-none}
+action_block_size: $action_block_size_override
 started_at: $(date --iso-8601=seconds)
 EOF
 match_args=()
@@ -196,6 +224,12 @@ printf 'Piper SDK 模式：%s，输出目录：%s\n' "$mode" "$output"
   source ./env.sh capture
   sdk_args=()
   if [[ "$mode" == --execute ]]; then sdk_args+=(--execute); fi
+  if [[ -n "$future_waypoint_index_override" ]]; then
+    sdk_args+=(--future-waypoint-index "$future_waypoint_index_override")
+  elif [[ -n "$future_waypoint_override" ]]; then
+    sdk_args+=("$future_waypoint_override")
+  fi
+  sdk_args+=(--action-block-size "$action_block_size_override")
   exec python -m data_collect.cli.umi_piper_sdk --setup "$runtime_setup" \
     --socket "$socket_path" --control-log "$output/control_events.jsonl" \
     --diagnostic-socket "$diagnostic_socket" "${sdk_args[@]}"
@@ -239,6 +273,11 @@ if [[ "$record_enabled" == 1 ]]; then
   model_args+=(--record-dir "$record_dir")
 fi
 model_args+=("${match_args[@]}")
+if [[ -n "$future_waypoint_index_override" ]]; then
+  model_args+=(--future-waypoint-index "$future_waypoint_index_override")
+elif [[ -n "$future_waypoint_override" ]]; then
+  model_args+=("$future_waypoint_override")
+fi
 "$model_python" scripts/piper_live_observation.py \
   "${model_args[@]}" \
   > >(tee -a "$output/model.log") 2>&1 &
