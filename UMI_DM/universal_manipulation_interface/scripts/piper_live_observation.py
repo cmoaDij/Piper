@@ -155,6 +155,15 @@ def main():
     parser.add_argument('--match-dataset', type=Path, help='Optional training Zarr dataset for first-frame overlay')
     parser.add_argument('--match-episode', type=int, default=0, help='Initial reference episode index, starting at 0')
     parser.add_argument('--match-alpha', type=float, default=.5, help='Initial reference opacity, 0..1')
+    waypoint = parser.add_mutually_exclusive_group()
+    waypoint.add_argument('--future-waypoint', dest='future_waypoint', action='store_true',
+                          help='Use latency-compensated future policy waypoint (default)')
+    waypoint.add_argument('--no-future-waypoint', dest='future_waypoint', action='store_false',
+                          help='Use prediction sequence index 0 immediately')
+    waypoint.add_argument('--future-waypoint-index', dest='future_waypoint_index', type=int,
+                          choices=range(16), metavar='N',
+                          help='Use fixed zero-based prediction sequence index N immediately')
+    parser.set_defaults(future_waypoint=None)
     args = parser.parse_args()
     if not np.isfinite(args.duration) or args.duration < 0:
         parser.error('--duration must be nonnegative')
@@ -187,6 +196,11 @@ def main():
     gripper_action_latency_s = float(latency.get('gripper_action_latency_s', robot_action_latency_s))
     lead_s = float(latency.get('additional_lead_s', 0.0))
     action_period_s = float(latency.get('action_period_s', .05005))
+    future_waypoint_enabled = (bool(latency.get('future_waypoint_enabled', True))
+                               if args.future_waypoint is None else args.future_waypoint)
+    future_waypoint_index = args.future_waypoint_index
+    if future_waypoint_index is not None:
+        future_waypoint_enabled = True
     if (not np.isfinite([camera_latency_s, robot_observation_latency_s,
                          robot_action_latency_s, gripper_action_latency_s, lead_s, action_period_s]).all()
             or camera_latency_s < 0 or robot_observation_latency_s < 0
@@ -332,13 +346,18 @@ def main():
                     rejected.append({'step': index, 'reason': str(exc)})
             planned_at = time.monotonic()
             try:
-                future_index = latency_compensated_action_index(
-                    pair[-1][0], planned_at, len(action),
-                    camera_latency_s=camera_latency_s,
-                    robot_action_latency_s=robot_action_latency_s,
-                    gripper_action_latency_s=gripper_action_latency_s,
-                    lead_s=lead_s,
-                    action_period=action_period_s)
+                if future_waypoint_index is not None:
+                    future_index = future_waypoint_index
+                elif future_waypoint_enabled:
+                    future_index = latency_compensated_action_index(
+                        pair[-1][0], planned_at, len(action),
+                        camera_latency_s=camera_latency_s,
+                        robot_action_latency_s=robot_action_latency_s,
+                        gripper_action_latency_s=gripper_action_latency_s,
+                        lead_s=lead_s,
+                        action_period=action_period_s)
+                else:
+                    future_index = 0
                 timing_rejection = None
             except ValueError as exc:
                 future_index, timing_rejection = None, str(exc)
@@ -367,7 +386,9 @@ def main():
                           'gripper_action_latency_s': gripper_action_latency_s,
                           # Legacy key retained for old analysis files.
                           'piper_tracking_latency_s': robot_action_latency_s,
+                          'future_waypoint_index': future_waypoint_index,
                           'additional_lead_s': lead_s,
+                          'future_waypoint_enabled': future_waypoint_enabled,
                           'action_period_s': action_period_s,
                           'reference_scene_time_monotonic_s': pair[-1][0] - camera_latency_s,
                       },

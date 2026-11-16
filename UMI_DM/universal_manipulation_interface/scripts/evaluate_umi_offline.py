@@ -55,6 +55,8 @@ def summarize(pred, target, baseline):
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument('--checkpoint', type=Path, required=True)
+    ap.add_argument('--dataset', type=Path, default=None,
+                    help='Optional local dataset override for the absolute path embedded in the checkpoint')
     ap.add_argument('--manifest', type=Path, required=True)
     ap.add_argument('--output', type=Path, required=True)
     ap.add_argument('--batch-size', type=int, default=16)
@@ -71,8 +73,17 @@ def main():
     payload = torch.load(str(args.checkpoint), map_location='cpu', pickle_module=dill, mmap=True)
     epoch = dill.loads(payload['pickles']['epoch'])
     config = payload['cfg']
-    if epoch != config.training.num_epochs:
-        raise RuntimeError(f'Checkpoint is at epoch {epoch}, expected {config.training.num_epochs}')
+    expected_epochs = int(config.training.num_epochs)
+    # Diffusion-policy workspaces commonly serialize the final zero-based
+    # epoch (N-1) while the config stores the requested count N.
+    if epoch not in (expected_epochs, expected_epochs - 1):
+        raise RuntimeError(f'Checkpoint is at epoch {epoch}, expected {expected_epochs} or {expected_epochs - 1}')
+    if args.dataset is not None:
+        dataset_path = args.dataset.expanduser().resolve()
+        if not dataset_path.is_file():
+            raise FileNotFoundError(f'Offline evaluation dataset does not exist: {dataset_path}')
+        OmegaConf.update(config, 'task.dataset.dataset_path', str(dataset_path), merge=False)
+        print('Using local dataset override:', dataset_path, flush=True)
     config.policy.obs_encoder.pretrained = False
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print('Loading EMA policy on', device, 'checkpoint epoch', epoch, flush=True)

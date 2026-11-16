@@ -1,0 +1,1 @@
+UMI_DM/checkpoints/*.ckpt filter=lfs diff=lfs merge=lfs -text
