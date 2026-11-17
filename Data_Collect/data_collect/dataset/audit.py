@@ -8,9 +8,12 @@ import h5py
 import numpy as np
 from av.error import FFmpegError
 
-from data_collect.dataset.alignment import action_indices, causal_indices
-from data_collect.common.config import IMAGE_STREAMS, atomic_json, fingerprint
+from data_collect.dataset.alignment import action_indices, causal_indices, segment_indices
+from data_collect.common.config import recorded_image_streams, atomic_json, fingerprint
 from data_collect.recording.images import validate_images
+from data_collect.recording.timing import alignment_grid, observation_timestamps
+from data_collect.recording.timeline import episode_grid
+from data_collect.calibration.tracking import recorded_tracking, response_reference_indices
 
 
 def checked_series(group, name, shape=None, finite=True):
@@ -30,7 +33,12 @@ def timestamps(group, name="available_host_ts_ns"):
     return arr.astype(np.int64)
 
 
-def audit_episode(path, rules):
+def audit_episode(path, rules, *, diagnostic_excluded_segments=()):
+    """Run normal gates, optionally diagnosing an explicitly selected subset.
+
+    A diagnostic subset never produces a training/export index cache. The raw
+    data and default whole-episode audit policy remain unchanged.
+    """
     path = Path(path).resolve()
     report = {"episode": path.name, "path": str(path), "status": "REJECT", "reasons": []}
     try:
@@ -44,29 +52,66 @@ def audit_episode(path, rules):
             if not str(f.attrs.get("task_instruction", "")).strip():
                 raise ValueError("缺少任务语言指令")
             start, end = int(f.attrs["start_host_ts_ns"]), int(f.attrs["end_host_ts_ns"])
-            duration = (end - start) / 1e9
+            # Keep the raw wall/active duration and views available even if
+            # a short GoPro segment prevents building aligned training steps.
+            _, _, intervals = episode_grid(f.attrs, rules["fps"])
+            duration = sum(upper - lower for lower, upper in intervals) / 1e9
             report["duration_s"] = duration
+            report["wall_duration_s"] = (end - start) / 1e9
+            report["recording_segments"] = len(intervals)
+            streams = recorded_image_streams(f)
+            report["image_streams"] = list(streams)
+            grid, grid_segments, intervals = alignment_grid(
+                f, rules["fps"], excluded_segments=diagnostic_excluded_segments)
+            if diagnostic_excluded_segments:
+                report["diagnostic_only"] = True
+                report["excluded_recording_segments"] = sorted(set(diagnostic_excluded_segments))
+                report["evaluated_recording_segments"] = np.unique(grid_segments).tolist()
+                report["excluded_duration_s"] = sum(
+                    intervals[s][1] - intervals[s][0] for s in set(diagnostic_excluded_segments)) / 1e9
+                report["evaluated_duration_s"] = duration - report["excluded_duration_s"]
+            report["aligned_frames"] = len(grid)
+            report["aligned_duration_s"] = len(grid) / rules["fps"]
             reasons = report["reasons"]
             if not rules["min_duration_s"] <= duration <= rules["max_duration_s"]:
                 reasons.append("duration_out_of_range")
             if end <= start:
                 raise ValueError("Episode 时间范围非法")
             validate_images(f, decode=True)
-            grid = np.arange(start, end, 1_000_000_000 // rules["fps"], dtype=np.int64)
+            def source_segments(group, source_ts):
+                if f.attrs.get("recording_mode") != "grip_paused":
+                    return np.zeros(len(source_ts), dtype=np.int64)
+                segment = checked_series(group, "recording_segment", ())
+                if (segment.dtype.kind not in "iu" or len(segment) != len(source_ts)
+                        or (segment < 0).any() or (segment >= len(intervals)).any()):
+                    raise ValueError(f"{group.name} 录制片段编号非法")
+                return segment
+
+            def match(matcher, group, source_ts, valid=None, **kwargs):
+                segments = source_segments(group, source_ts)
+                # In-flight samples accepted before an IPC pause reached the
+                # image process cannot extend the explicitly closed interval.
+                valid_time = source_ts < np.asarray(intervals, dtype=np.int64)[segments, 1]
+                if valid is not None:
+                    valid_time &= valid
+                return segment_indices(matcher, source_ts, grid, segments, grid_segments,
+                                       valid=valid_time, **kwargs)
             yellow = np.zeros(len(grid), dtype=bool)
             reused = np.zeros(len(grid), dtype=bool)
             indices, ages, selected_ts = {}, {}, {}
-            for stream in IMAGE_STREAMS:
+            for stream in streams:
                 group = f[stream]
-                ts = timestamps(group)
+                timestamps(group)  # Keep receive-clock integrity checks too.
+                ts = observation_timestamps(group)
                 fid = checked_series(group, "frame_id", ())
                 if len(fid) != len(ts):
                     raise ValueError(f"{stream} frame_id 长度不一致")
                 # An SDK cache frame is available at its FIRST retrieval, never refreshed by polling.
-                _, unique = np.unique(fid, return_index=True)
+                segments = source_segments(group, ts)
+                _, unique = np.unique(np.column_stack((segments, fid)), axis=0, return_index=True)
                 valid = np.zeros(len(fid), dtype=bool)
                 valid[unique] = True
-                index, age = causal_indices(ts, grid, valid)
+                index, age = match(causal_indices, group, ts, valid)
                 indices[stream] = index.tolist()
                 ages[stream] = age
                 selected_ts[stream] = ts[index]
@@ -74,7 +119,7 @@ def audit_episode(path, rules):
                 if np.any(age > rules[prefix + "_red_ms"] * 1e6):
                     reasons.append(stream + "_age_red")
                 yellow |= age > rules[prefix + "_green_ms"] * 1e6
-                reused[1:] |= index[1:] == index[:-1]
+                reused[1:] |= (index[1:] == index[:-1]) & (grid_segments[1:] == grid_segments[:-1])
                 report[stream.replace("/", "_") + "_max_age_ms"] = float(age.max() / 1e6)
             skew = np.abs(selected_ts["tactile/left_raw"] - selected_ts["tactile/right_raw"])
             if np.any(skew > rules["tactile_skew_red_ms"] * 1e6):
@@ -90,7 +135,8 @@ def audit_episode(path, rules):
             new = checked_series(feedback, "is_new_packet", ()).astype(bool)
             if any(len(a) != len(ts) for a in (joint, grip, tcp, new)):
                 raise ValueError("机器人反馈长度不一致")
-            index, _ = causal_indices(ts, grid, new)
+            feedback_segments = source_segments(feedback, ts)
+            index, _ = match(causal_indices, feedback, ts, new)
             indices["robot_feedback"] = index.tolist()
             robot_age = np.zeros(len(grid), dtype=np.int64)
             for component in ("joint", "tcp", "gripper"):
@@ -123,7 +169,9 @@ def audit_episode(path, rules):
                 raise ValueError("指令字段长度不一致")
             if (cmd_end < cmd_ts).any() or (np.diff(cmd_seq) <= 0).any():
                 raise ValueError("指令时序或序号错误")
-            cmd_index, held = action_indices(cmd_ts, grid, int(rules["action_window_ms"] * 1e6))
+            command_segments = source_segments(command, cmd_ts)
+            cmd_index, held = match(action_indices, command, cmd_ts,
+                                    half_window_ns=int(rules["action_window_ms"] * 1e6))
             indices["robot_command"] = cmd_index.tolist()
             holds = grid - cmd_ts[cmd_index]
             for k in np.flatnonzero(held & (holds > rules["action_max_hold_ms"] * 1e6)):
@@ -131,7 +179,8 @@ def audit_episode(path, rules):
                 lookback = int(rules["stationary_lookback_s"] * 1e9)
                 lower = np.searchsorted(ts, grid[k] - lookback, side="right") - 1
                 upper = index[k] + 1
-                stationary = lower >= 0 and upper > lower
+                stationary = (lower >= 0 and upper > lower
+                              and np.all(feedback_segments[lower:upper] == grid_segments[k]))
                 if stationary:
                     q = joint[lower:upper]
                     g = grip[lower:upper]
@@ -151,30 +200,23 @@ def audit_episode(path, rules):
             report["yellow_ratio"] = float(yellow.mean())
             if yellow.mean() > rules["max_yellow_ratio"]:
                 reasons.append("yellow_ratio_exceeded")
-            if np.any(yellow[1:] & yellow[:-1]):
+            if np.any(yellow[1:] & yellow[:-1] & (grid_segments[1:] == grid_segments[:-1])):
                 reasons.append("consecutive_yellow_steps")
 
             contact = np.zeros(len(grid), dtype=bool)
-            for values, times in ((target_grip, cmd_ts), (grip, ts)):
-                anchor = values[0]
-                for value, time_ns in zip(values[1:], times[1:]):
-                    if abs(value - anchor) >= rules["gripper_change_m"]:
-                        contact |= np.abs(grid - time_ns) <= rules["contact_window_s"] * 1e9
-                        anchor = value
+            for values, times, segments in ((target_grip, cmd_ts, command_segments),
+                                            (grip, ts, feedback_segments)):
+                for segment in np.unique(grid_segments):
+                    selected = segments == segment
+                    local_values, local_times = values[selected], times[selected]
+                    anchor = local_values[0]
+                    for value, time_ns in zip(local_values[1:], local_times[1:]):
+                        if abs(value - anchor) >= rules["gripper_change_m"]:
+                            contact |= ((grid_segments == segment)
+                                        & (np.abs(grid - time_ns) <= rules["contact_window_s"] * 1e9))
+                            anchor = value
             if np.any(contact & (yellow | reused)):
                 reasons.append("contact_window_frame_reuse_or_yellow")
-            aligned_grip = grip[index]
-            state = 0
-            for value in aligned_grip:
-                if state == 0 and value >= rules["open_threshold_m"]:
-                    state = 1
-                elif state == 1 and value <= rules["closed_threshold_m"]:
-                    state = 2
-                elif state == 2 and value >= rules["open_threshold_m"]:
-                    state = 3
-            report["gripper_cycle_complete"] = state == 3
-            if rules["require_gripper_cycle"] and state != 3:
-                reasons.append("missing_open_close_open_cycle")
             if not reasons:
                 report["status"] = "PASS"
             sync = {
@@ -183,13 +225,25 @@ def audit_episode(path, rules):
                 "source_sha256": fingerprint(path),
                 "fps": rules["fps"],
                 "grid_host_ts_ns": grid.tolist(),
+                "recording_segment": grid_segments.tolist(),
+                "recording_intervals_host_ts_ns": intervals,
                 "indices": indices,
+                "image_streams": list(streams),
+                "timestamp_policy": ("gopro_calibrated_scene_time_offline_v1"
+                                     if any(f[s].attrs.get("backend") == "gopro" for s in streams)
+                                     else "available_host_time_v1"),
                 "rules": rules,
                 "automatic_status": report["status"],
             }
             report["source_sha256"] = sync["source_sha256"]
-            return report, sync if report["status"] == "PASS" else None
+            tracking = recorded_tracking(f)
+            if tracking:
+                sync["robot_tracking_latency"] = tracking
+                sync["tracking_reference_indices"] = response_reference_indices(f, grid, grid_segments, intervals).tolist()
+                report["robot_tracking_latency_ms"] = [value / 1e6 for value in tracking["latency_ns"]]
+            return report, sync if report["status"] == "PASS" and not diagnostic_excluded_segments else None
     except (KeyError, ValueError, OSError, TypeError, IndexError, FFmpegError) as exc:
+        report["status"] = "REJECT"
         report["reasons"].append(f"invalid_episode: {exc}")
         return report, None
 

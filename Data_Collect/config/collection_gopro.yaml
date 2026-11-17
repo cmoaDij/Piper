@@ -1,0 +1,80 @@
+# 本轮实测 GoPro + Piper-X 工况；数据单独保存，B 停止后以 5% 速度自动回零。
+# Paths are relative to Data_Collect, regardless of the caller's current directory.
+data_root: data/gopro_collection
+robot_tracking_latency_file: data/calibration/piper_tracking_latency.json
+task_instruction: "抓起物体并放到目标位置"
+operator: operator_01
+calibration_id: calibration_v1
+calibration_file: data/calibration/calibration_v1.json
+queue_max_items: 2048
+queue_max_mb: 256
+storage:
+  batch_ms: 50
+  batch_max_items: 128
+  video_encoder: auto  # 实测 NVENC 优先；不可用时回退 libx264
+  encoder_threads: 1
+  video_quality: 18  # NVENC CQ / libx264 CRF；数值越小质量越高
+feedback_hz: 200
+control_hz: 50
+gripper_max_m: 0.07
+camera_timeout_ms: 500
+arm_type: piper_x
+urdf: ros_ws/src/agx_arm_description/agx_arm_urdf/piper_x/urdf/piper_x_with_gripper_description.urdf
+base_link: base_link
+tip_link: link6
+tcp_offset: [0.0, 0.0, 0.195, 0.0, 0.0, 0.0]
+# Driver motion settings follow QuestArmTeleop's Piper-X launch; see delta_frame below.
+teleop:
+  # Controller-frame correction from QuestArmTeleop's Piper-X launch, in radians.
+  ros_to_arm_rpy: [-1.5708, 0.0, -1.5708]
+  # Map controller-local changes into the captured TCP frame, as QuestArmTeleop does.
+  delta_frame: tcp
+  # Grip trigger (middle finger); the index trigger rightTrig controls the gripper.
+  follow_button: RG
+  fast_mode: true
+  speed_percent: 50
+  home_speed_percent: 5
+  home_position_tolerance: 0.03
+  auto_home_on_stop: true
+  auto_home_delay_s: 0.5
+cameras:
+  global_rgb: {serial: "324422300699", width: 640, height: 480, fps: 30}
+  wrist_rgb: {serial: "140122074456", width: 640, height: 480, fps: 30}
+# 完整 RealSense 组合连接时优先使用原方案；否则识别 GoPro HDMI/UVC。
+# 单台 GoPro 默认安装在手腕；两台时请分别配置稳定的 by-id 路径。
+camera_selection:
+  mode: gopro  # auto / realsense / gopro；启动时选定，录制中不热切换
+  gopro:
+    calibration_id: calibration_gopro_v1
+    calibration_file: data/calibration/calibration_gopro_v1.json
+    cameras:
+      wrist_rgb:
+        device: /dev/v4l/by-id/usb-MACROSILICON_UGREEN_35287_86477247-video-index0
+        width: 1280
+        height: 960
+        fps: 60
+        receive_latency_file: data/calibration/gopro_wrist_latency.json
+tactile:
+  left_raw: {dev_id: "X2631410810", backend: cpu, mode: standard, max_fps: 60, color_order: bgr}
+  right_raw: {dev_id: "X2631410795", backend: cpu, mode: standard, max_fps: 60, color_order: bgr}
+audit:
+  fps: 20
+  min_duration_s: 5
+  max_duration_s: 30
+  rgb_green_ms: 40
+  rgb_red_ms: 68
+  tactile_green_ms: 35
+  tactile_red_ms: 55
+  robot_red_ms: 25
+  tactile_skew_green_ms: 15
+  tactile_skew_red_ms: 25
+  max_yellow_ratio: 0.02
+  contact_window_s: 0.5
+  gripper_change_m: 0.001
+  action_window_ms: 25
+  action_max_hold_ms: 100
+  stationary_joint_tolerance_rad: 0.003
+  stationary_gripper_tolerance_m: 0.001
+  stationary_lookback_s: 0.1
+  val_fraction: 0.2
+  split_seed: 42

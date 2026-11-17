@@ -27,6 +27,7 @@ a{color:inherit}
 .control-note{color:var(--muted);font-size:10px;line-height:1.9;margin:3px 0 23px}
 kbd{font:10px ui-monospace,monospace;background:#29384a;border:1px solid #3b4e66;border-radius:3px;padding:0 4px;color:var(--text)}
 .sensor{display:flex;align-items:center;gap:8px;margin-bottom:13px}
+.sensor[hidden]{display:none}
 .dot{display:inline-block;width:6px;height:6px;background:#617388;border-radius:100%;flex-shrink:0}
 .teal,.dot.good{background:var(--teal)}
 .dot.bad{background:var(--red)}

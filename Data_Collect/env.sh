@@ -15,6 +15,9 @@ _piper_activate_environment() {
     fi
     if [[ ! -x "$root/.runtime/$mode/bin/python" ]]; then
         echo "环境尚未安装：$root/.runtime/$mode" >&2
+        if [[ "$mode" == capture ]]; then
+            echo "首次安装纯遥操环境：$root/setup_teleop.sh" >&2
+        fi
         return 1
     fi
     if declare -F deactivate >/dev/null; then deactivate; fi
@@ -53,7 +56,10 @@ _piper_activate_environment() {
         # Installed ROS scripts share the collection package's executor.
         export PYTHONPATH="$root${PYTHONPATH:+:$PYTHONPATH}"
         export PATH="$root/.runtime/platform-tools:$root/.runtime/bin:$PATH"
-        export ADB_VENDOR_KEYS="$root/.runtime/android/adbkey"
+        # Reuse the user's authorized ADB key unless a project key is installed.
+        if [[ -f "$root/.runtime/android/adbkey" ]]; then
+            export ADB_VENDOR_KEYS="$root/.runtime/android/adbkey"
+        fi
     else
         source "$root/.runtime/export/bin/activate" || return
         export PATH="$root/.runtime/bin:$PATH"

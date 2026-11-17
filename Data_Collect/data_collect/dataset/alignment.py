@@ -3,6 +3,28 @@
 import numpy as np
 
 
+def segment_indices(matcher, timestamps, grid, sample_segments, grid_segments, valid=None, **kwargs):
+    """Match only within each recorded interval, never across a clutch pause."""
+    timestamps, grid = np.asarray(timestamps), np.asarray(grid)
+    sample_segments, grid_segments = np.asarray(sample_segments), np.asarray(grid_segments)
+    result = np.empty(len(grid), dtype=np.int64)
+    auxiliary = None
+    for segment in np.unique(grid_segments):
+        selected = sample_segments == segment
+        if valid is not None:
+            selected &= valid
+        source = np.flatnonzero(selected)
+        target = grid_segments == segment
+        if not len(source):
+            raise ValueError(f"录制片段 {segment} 缺少有效样本")
+        local, info = matcher(timestamps[source], grid[target], **kwargs)
+        result[target] = source[local]
+        if auxiliary is None:
+            auxiliary = np.empty(len(grid), dtype=info.dtype)
+        auxiliary[target] = info
+    return result, auxiliary
+
+
 def causal_indices(timestamps, grid, valid=None):
     timestamps = np.asarray(timestamps, dtype=np.int64)
     source = np.arange(len(timestamps))

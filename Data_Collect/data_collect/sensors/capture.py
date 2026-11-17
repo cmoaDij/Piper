@@ -10,17 +10,19 @@ from collections import deque
 from pathlib import Path
 
 from data_collect.sensors.cameras import realsense_worker
+from data_collect.sensors.gopro import gopro_worker
 from data_collect.sensors.tactile import tactile_worker
-from data_collect.common.config import IMAGE_STREAMS, local_path
+from data_collect.common.config import IMAGE_STREAMS, image_streams, local_path
 from data_collect.control.kinematics import ForwardKinematics
 from data_collect.recording.images import select_encoder
 from data_collect.recording.storage import EpisodeManager, EpisodeWriter
+from data_collect.recording.timeline import RecordingTimeline
 
 
 class ImageBuffer(EpisodeManager):
     def __init__(self, cfg, fk):
         super().__init__(cfg, fk)
-        self.history = {name: deque(maxlen=16) for name in IMAGE_STREAMS}
+        self.history = {name: deque(maxlen=16) for name in image_streams(cfg)}
 
     def emit(self, group, record):
         with self.lock:
@@ -33,18 +35,29 @@ class ImageBuffer(EpisodeManager):
                 raise RuntimeError("采集进程已有正在录制的 Episode")
             writer = EpisodeWriter(path, metadata, max_items, max_bytes, dict(self.baselines), self.fk)
             self.current = writer
-            start = metadata["start_host_ts_ns"]
-            for stream, records in self.history.items():
-                past = [r for r in records if int(r["available_host_ts_ns"]) <= start]
-                if not past:
-                    self.fail(f"{stream} 缺少录制开始前图像，IPC 延迟超过缓存范围")
-                    break
-                seed = [past[-1]] + [r for r in records if int(r["available_host_ts_ns"]) > start]
+            self.seed_images(writer, metadata["start_host_ts_ns"])
+            return writer
+
+    def seed_images(self, writer, start):
+        for stream, records in self.history.items():
+            if stream.startswith("cameras/") and self.cfg["cameras"][stream.split("/")[-1]].get("backend") == "gopro":
+                # Delayed pictures of the pause must not enter the resumed
+                # segment. The first post-resume exposure arrives later.
+                seed = [r for r in records if int(r.get("capture_host_ts_ns", 0)) >= start]
                 for record in seed:
-                    if not writer.submit(stream, record):
+                    if not writer.submit(stream, record, seed=True):
                         self.fail(writer.error or "writer_not_accepting_samples")
                         break
-            return writer
+                continue
+            past = [r for r in records if int(r["available_host_ts_ns"]) <= start]
+            if not past:
+                self.fail(f"{stream} 缺少恢复前图像，IPC 延迟超过缓存范围")
+                break
+            seed = [past[-1]] + [r for r in records if int(r["available_host_ts_ns"]) > start]
+            for record in seed:
+                if not writer.submit(stream, record, seed=True):
+                    self.fail(writer.error or "writer_not_accepting_samples")
+                    break
 
 
 def _capture_main(cfg, incoming, outgoing, stop):
@@ -52,11 +65,10 @@ def _capture_main(cfg, incoming, outgoing, stop):
     # SIGTERM remains available for escalation if that owner cannot shut down.
     signal.signal(signal.SIGINT, signal.SIG_IGN)
     # Spawn keeps these native SDKs and their worker/GIL activity out of control.
-    import pyrealsense2  # noqa: F401
     import onnxruntime  # noqa: F401
     from dmrobotics import Sensor  # noqa: F401
 
-    # Probe the actual two-camera workload before devices become ready for A.
+    # Probe the selected camera workload before devices become ready for A.
     select_encoder(cfg)
     fk = ForwardKinematics(local_path(cfg["urdf"]), cfg["base_link"], cfg["tip_link"], cfg["tcp_offset"])
     manager = ImageBuffer(cfg, fk)
@@ -93,7 +105,8 @@ def _capture_main(cfg, incoming, outgoing, stop):
     try:
         status()
         for name, opts in cfg["cameras"].items():
-            start_worker(realsense_worker, name, opts, manager, stop, cfg["camera_timeout_ms"])
+            worker = gopro_worker if opts.get("backend") == "gopro" else realsense_worker
+            start_worker(worker, name, opts, manager, stop, cfg["camera_timeout_ms"])
         for name, opts in cfg["tactile"].items():
             start_worker(tactile_worker, name, opts, manager, stop)
         next_status = time.monotonic()
@@ -108,10 +121,18 @@ def _capture_main(cfg, incoming, outgoing, stop):
                     path, metadata, max_items, max_bytes = args
                     writers[path] = manager.open_writer(path, metadata, max_items, max_bytes)
                 elif kind == "record":
-                    path, group, record = args
+                    path, group, record, seed = args
                     writer = writers[path]
-                    if not writer.submit(group, record):
+                    if not writer.submit(group, record, seed=seed):
                         manager.fail(writer.error or "writer_not_accepting_samples")
+                elif kind == "recording":
+                    path, active, stamp_ns = args
+                    with manager.lock:
+                        writer = writers[path]
+                        if not writer.set_recording(active, stamp_ns):
+                            manager.fail(writer.error or "切换写入状态失败")
+                        elif active:
+                            manager.seed_images(writer, stamp_ns)
                 elif kind == "finish":
                     path, end_ns, error, rejected = args
                     with manager.lock:
@@ -161,22 +182,43 @@ class CaptureWriter:
         self.rejection = None
         self.lock, self.done = threading.Lock(), threading.Event()
         self.end_ns = None
+        self.timeline = (RecordingTimeline(metadata["start_host_ts_ns"])
+                         if metadata.get("recording_mode") == "grip_paused" else None)
         self.thread = self
         runtime.writers[str(self.path)] = self
         if not runtime.send(("open", str(self.path), metadata, max_items, max_bytes)):
             self.error = "采集 IPC 队列已满/进程不可用"
             self.done.set()
 
-    def submit(self, group, record):
-        if self.error or self.done.is_set():
-            return False
-        if group in IMAGE_STREAMS:
+    def submit(self, group, record, *, seed=False):
+        with self.lock:
+            if self.error or self.done.is_set():
+                return False
+            if self.timeline is not None and self.timeline.prepare(group, record, seed=seed) is None:
+                return True
+            if group in IMAGE_STREAMS:
+                return True
+            return self.runtime.send(("record", str(self.path), group, record, seed))
+
+    def set_recording(self, active, stamp_ns):
+        with self.lock:
+            if self.error or self.done.is_set():
+                return False
+            if self.timeline is not None:
+                if self.timeline.active == bool(active):
+                    return True
+                self.timeline.set_recording(active, stamp_ns)
+            if not self.runtime.send(("recording", str(self.path), bool(active), int(stamp_ns))):
+                self.error = "采集 IPC 切换写入状态失败"
+                return False
             return True
-        return self.runtime.send(("record", str(self.path), group, record))
 
     def finish(self, end_ns, error=None, *, rejected=False):
         if self.end_ns is None:
             self.end_ns = int(end_ns)
+            if self.timeline is not None:
+                with self.lock:
+                    self.timeline.set_recording(False, end_ns)
         if error:
             if rejected:
                 self.rejection = error
@@ -241,7 +283,7 @@ class CaptureRuntime:
                         if stamps:
                             self.manager.latest[name] = {"available_host_ts_ns": stamps[-1]}
                     self.manager.baselines = dict.fromkeys(data["baselines"])
-                    self.ready = all(data["streams"].get(name) for name in IMAGE_STREAMS) and len(data["baselines"]) == 2
+                    self.ready = all(data["streams"].get(name) for name in image_streams(self.cfg)) and len(data["baselines"]) == 2
                     for name, domain in data["domains"].items():
                         if domain:
                             self.cfg["cameras"][name]["device_timestamp_domain"] = domain
@@ -268,7 +310,7 @@ class CaptureRuntime:
             limit = 0.25 if self.ready else 15.0
             origin = (self.last_status or self.started) if self.ready else self.started
             if not self.closing and time.monotonic() - origin > limit and not self.manager.failure:
-                self.manager.fail(f"采集进程状态超过 {limit:g} 秒未更新，停止录制和运动")
+                self.manager.fail(f"采集进程状态超过 {limit:g} 秒未更新，停止录制；遥操不受影响")
 
     def close(self):
         try:

@@ -8,7 +8,7 @@ from pathlib import Path
 import av
 import numpy as np
 
-from data_collect.common.config import IMAGE_STREAMS, fingerprint
+from data_collect.common.config import recorded_image_streams, fingerprint
 
 
 def _stream(container, encoder, width, height, fps, settings):
@@ -54,7 +54,7 @@ def _select_encoder(preference, profiles, threads, quality):
                 with av.open(io.BytesIO(buffer.getvalue())) as decoded:
                     if sum(1 for _ in decoded.decode(video=0)) != 3:
                         raise ValueError("编码探测帧数不符")
-            print(f"RGB 视频编码器: {encoder}（双路试编码通过）" + (f"；回退原因: {errors}" if errors else ""), flush=True)
+            print(f"RGB 视频编码器: {encoder}（{len(profiles)} 路试编码通过）" + (f"；回退原因: {errors}" if errors else ""), flush=True)
             return encoder
         except Exception as exc:
             errors.append(f"{encoder}: {type(exc).__name__}: {exc}")
@@ -133,7 +133,7 @@ def image_shape(group, *, rgb=False):
 
 def validate_images(file, *, decode=False):
     """Bind external videos to the HDF5 hash; optionally verify every decoded PTS."""
-    for name in IMAGE_STREAMS:
+    for name in recorded_image_streams(file):
         group = file[name]
         count = len(group["available_host_ts_ns"])
         if count == 0:

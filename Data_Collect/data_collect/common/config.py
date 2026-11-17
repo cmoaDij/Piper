@@ -10,6 +10,21 @@ from .paths import ROOT
 IMAGE_STREAMS = ("cameras/global_rgb", "cameras/wrist_rgb", "tactile/left_raw", "tactile/right_raw")
 
 
+def image_streams(config):
+    """Selected camera roles plus the existing two tactile streams."""
+    return tuple(f"cameras/{name}" for name in config["cameras"]) + IMAGE_STREAMS[2:]
+
+
+def recorded_image_streams(file):
+    # Old recordings always contain both RealSense cameras.
+    streams = tuple(json.loads(file.attrs["image_streams"])) if "image_streams" in file.attrs else IMAGE_STREAMS
+    if (len(set(streams)) != len(streams) or not set(streams).issubset(IMAGE_STREAMS)
+            or not set(IMAGE_STREAMS[2:]).issubset(streams)
+            or not any(s.startswith("cameras/") for s in streams)):
+        raise ValueError("录制图像流清单非法")
+    return streams
+
+
 def local_path(value):
     path = Path(value).expanduser()
     return path.resolve() if path.is_absolute() else (ROOT / path).resolve()
@@ -40,11 +55,16 @@ def load_config(path=None):
     quality = storage.setdefault("video_quality", 18)
     if not isinstance(quality, int) or isinstance(quality, bool) or not 0 <= quality <= 51:
         raise ValueError("storage.video_quality 必须为 0–51 的整数")
-    for camera in cfg["cameras"].values():
+    selection = cfg.get("camera_selection", {})
+    if selection.get("mode", "realsense") not in ("auto", "realsense", "gopro"):
+        raise ValueError("camera_selection.mode 必须为 auto/realsense/gopro")
+    profiles = [cfg["cameras"], selection.get("gopro", {}).get("cameras", {})]
+    for profile in profiles:
+        if set(profile) - {"global_rgb", "wrist_rgb"}:
+            raise ValueError("相机位置必须为 global_rgb/wrist_rgb")
+    for camera in (c for profile in profiles for c in profile.values()):
         if any(not isinstance(camera[k], int) or isinstance(camera[k], bool) or camera[k] <= 0 for k in ("width", "height", "fps")) or camera["width"] % 2 or camera["height"] % 2:
             raise ValueError("视频要求正整数帧率及正偶数宽高")
-    if not 0 < cfg["command_timeout_s"] <= 0.25:
-        raise ValueError("command_timeout_s 必须在 (0, 0.25] 秒内")
     if not 0 < cfg["control_hz"] <= cfg["feedback_hz"]:
         raise ValueError("控制频率必须为正且不超过反馈轮询频率")
     for key in ("urdf", "calibration_file"):
@@ -52,9 +72,6 @@ def load_config(path=None):
             raise ValueError(f"{key} 必须位于 Data_Collect 内")
     if cfg["arm_type"] != "piper_x":
         raise ValueError("当前实机反馈已核对为 Piper-X，请勿使用标准 Piper 模型")
-    for key, value in cfg["motion"].items():
-        if not isinstance(value, (float, int)) or isinstance(value, bool) or not math.isfinite(value) or value <= 0:
-            raise ValueError(f"motion.{key} 必须为有限正数")
     if len(cfg["tcp_offset"]) != 6 or not all(math.isfinite(v) for v in cfg["tcp_offset"]):
         raise ValueError("tcp_offset 必须为有限的六维 xyz/rpy")
     return cfg

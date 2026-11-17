@@ -8,7 +8,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
-from data_collect.common.config import IMAGE_STREAMS, atomic_json, fingerprint
+from data_collect.common.config import IMAGE_STREAMS, recorded_image_streams, atomic_json, fingerprint
+from data_collect.recording.timing import observation_timestamps
 from data_collect.recording.images import EpisodeImages, validate_images
 
 HTML = """<!doctype html><html lang="zh-CN"><meta charset="utf-8">
@@ -17,7 +18,8 @@ body{font:16px system-ui;background:#101820;color:#e6edf5;margin:24px}button,sel
 #views{display:grid;grid-template-columns:1fr 1fr;gap:8px;max-width:1000px}img{width:100%;height:180px;object-fit:contain;background:#17232f}pre{white-space:pre-wrap;font-size:13px}
 h1{font-size:26px;margin-bottom:10px}details{margin-top:10px}.pass{color:#8fe3a0}.reject{color:#ffadad}#seek{width:70%}
 #empty{white-space:pre-line;color:#ffd68a}#views[hidden]{display:none}button:disabled{opacity:.45;cursor:not-allowed}</style>
-<h1>Episode 人工质检</h1><p>核对四路图像及夹爪动作；自动 REJECT 无法人工放行。待审核数据不会进入转换白名单。</p>
+<h1>Episode 人工质检</h1><p>核对相机、触觉图像及夹爪动作；自动 REJECT 无法人工放行。待审核数据不会进入转换白名单。</p>
+<p id="source"></p>
 <button id="refresh">刷新列表</button><p id="empty" role="status"></p>
 <select id="episodes"></select><button id="play">播放 / 暂停</button>
 <input id="seek" type="range" value="0" min="0" max="0"><span id="position"></span>
@@ -26,10 +28,11 @@ h1{font-size:26px;margin-bottom:10px}details{margin-top:10px}.pass{color:#8fe3a0
 <button id="approve">通过此条</button><button id="reject">剔除此条</button><button id="pending">恢复待审核</button>
 <pre id="result"></pre><details><summary>自动质检详情</summary><pre id="report"></pre></details>
 <details><summary>当前关节状态与指令</summary><pre id="state"></pre></details><script>
-const token='__TOKEN__', streams=['cameras/global_rgb','cameras/wrist_rgb','tactile/left_raw','tactile/right_raw'];
+const token='__TOKEN__', defaultStreams=['cameras/global_rgb','cameras/wrist_rgb','tactile/left_raw','tactile/right_raw'];let streams=[];
 const $=id=>document.getElementById(id); let rows=[], playing=false, busy=false, pendingFrame=false;
-for(const s of streams){const box=document.createElement('div'),label=document.createElement('div'),img=document.createElement('img');
-label.textContent=s;img.id=s;img.alt=s;box.append(label,img);$('views').append(box);}
+$('source').textContent='扫描录制目录：'+__RAW_DIR_JSON__;
+function views(selected){streams=selected;$('views').replaceChildren();for(const s of streams){const box=document.createElement('div'),label=document.createElement('div'),img=document.createElement('img');
+label.textContent=s;img.id=s;img.alt=s;box.append(label,img);$('views').append(box);}}
 function current(){return rows[Number($('episodes').value)]}
 async function frame(){if(!rows.length)return;$('approve').disabled=true;if(busy){pendingFrame=true;return}busy=true;
 const row=current(), k=Number($('seek').value);$('position').textContent=`${k+1}/${row.frames}`;
@@ -38,17 +41,18 @@ let loaded=false;try{const results=await Promise.all(streams.map(s=>new Promise(
 loaded=results.every(Boolean);const r=await fetch('/api/state?'+query);const state=await r.json();if(row===current())$('state').textContent=JSON.stringify(state,null,2);
 }catch(error){$('result').textContent=String(error)}finally{busy=false;if(pendingFrame){pendingFrame=false;frame()}else $('approve').disabled=!loaded||!current()||current().status!=='PASS';}}
 function select(){playing=false;const row=current();if(!row)return;$('seek').max=row.frames-1;$('seek').value=0;
+views(row.image_streams||defaultStreams);
 $('report').textContent=JSON.stringify(row,null,2);$('approve').disabled=row.status!=='PASS';frame();}
 function emptyState(message){playing=false;rows=[];$('episodes').replaceChildren();$('views').hidden=true;
 for(const id of ['episodes','play','seek','approve','reject','pending'])$(id).disabled=true;
 $('empty').textContent=message;$('position').textContent='';$('report').textContent='';$('state').textContent='';}
-async function refresh(){playing=false;try{const response=await fetch('/api/episodes');const data=await response.json();
+async function refresh(rescan=false){playing=false;try{if(rescan){const r=await fetch('/api/rescan',{method:'POST',headers:{'Content-Type':'application/json','X-Review-Token':token},body:'{}'});if(!r.ok){const error=await r.json();throw new Error(error.error||'重新扫描失败')}}const response=await fetch('/api/episodes');const data=await response.json();
 if(!response.ok)throw new Error(data.error||'审核列表读取失败');rows=data;$('episodes').replaceChildren();
-if(!rows.length){emptyState('暂无可审核的轨迹。完成采集后，在 Data_Collect 目录重新运行：\\npython3 -m data_collect.cli.review\\n程序会自动质检并加载审核列表。');return}
+if(!rows.length){emptyState('扫描目录中尚无录制文件。机械臂能遥操不代表数据已经写入。\\n请检查采集终端是否出现 Recording 文件路径，或“无法开始录制”的错误；相机、触觉或标定未就绪时不会开始录制。\\n按 B 结束封盘后，点击“刷新列表”重新扫描。');return}
 $('empty').textContent='';$('views').hidden=false;for(const id of ['episodes','play','seek','reject','pending'])$(id).disabled=false;
 rows.forEach((r,i)=>{let o=document.createElement('option');o.value=i;o.textContent=`${r.episode} | ${r.status} | ${r.review}`;$('episodes').append(o)});select();
 }catch(error){emptyState('无法读取审核列表：'+error.message+'\\n处理后点击“刷新列表”重试。')}}
-$('refresh').onclick=refresh;
+$('refresh').onclick=()=>refresh(true);
 $('episodes').onchange=select;$('seek').oninput=frame;$('play').onclick=()=>playing=!playing;
 setInterval(()=>{if(playing&&!busy){if(Number($('seek').value)<Number($('seek').max)){$('seek').value=Number($('seek').value)+1;frame()}else playing=false}},50);
 for(const decision of ['approve','reject','pending'])$(decision).onclick=async()=>{playing=false;if(!current())return;
@@ -58,10 +62,11 @@ $('result').textContent=await r.text();if(r.ok){current().review=decision;$('epi
 refresh();</script></html>"""
 
 
-def make_review_server(audit_dir, rules, host="127.0.0.1", port=8765):
+def make_review_server(audit_dir, rules, host="127.0.0.1", port=8765, *, raw_dir=None):
     if host not in ("127.0.0.1", "localhost", "::1"):
         raise ValueError("人工审核服务仅绑定本机")
     audit_dir = Path(audit_dir).resolve()
+    raw_dir = Path(raw_dir).resolve() if raw_dir is not None else audit_dir.parent / "raw"
     decision_path = audit_dir / "review_decisions.json"
     decisions = (
         json.loads(decision_path.read_text(encoding="utf-8")) if decision_path.exists() else {}
@@ -103,7 +108,9 @@ def make_review_server(audit_dir, rules, host="127.0.0.1", port=8765):
                 params = parse_qs(query.query)
                 if query.path == "/":
                     self.send(
-                        HTML.replace("__TOKEN__", token).encode("utf-8"), "text/html; charset=utf-8"
+                        HTML.replace("__TOKEN__", token).replace(
+                            "__RAW_DIR_JSON__", json.dumps(str(raw_dir), ensure_ascii=False).replace("<", "\\u003c")
+                        ).encode("utf-8"), "text/html; charset=utf-8"
                     )
                     return
                 if query.path == "/api/episodes":
@@ -113,7 +120,10 @@ def make_review_server(audit_dir, rules, host="127.0.0.1", port=8765):
                         frames = (
                             len(sync["grid_host_ts_ns"])
                             if sync
-                            else max(1, int(row.get("duration_s", 1) * 20))
+                            # Raw diagnostic previews use the physical wall
+                            # clock below. Include pauses so the tail of a
+                            # rejected recording remains reachable.
+                            else max(1, int(row.get("wall_duration_s", row.get("duration_s", 1)) * 20))
                         )
                         result.append(
                             {
@@ -142,12 +152,12 @@ def make_review_server(audit_dir, rules, host="127.0.0.1", port=8765):
                 with h5py.File(row["path"], "r") as f:
                     if query.path == "/api/frame":
                         stream = params["stream"][0]
-                        if stream not in IMAGE_STREAMS:
+                        if stream not in recorded_image_streams(f):
                             raise ValueError("unknown stream")
                         if sync:
                             index = sync["indices"][stream][k]
                         else:
-                            ts = f[stream + "/available_host_ts_ns"][:]
+                            ts = observation_timestamps(f[stream])
                             t = int(f.attrs["start_host_ts_ns"]) + k * 50_000_000
                             index = int(
                                 np.clip(np.searchsorted(ts, t, side="right") - 1, 0, len(ts) - 1)
@@ -162,18 +172,20 @@ def make_review_server(audit_dir, rules, host="127.0.0.1", port=8765):
                         if sync:
                             i = sync["indices"]["robot_feedback"][k]
                             j = sync["indices"]["robot_command"][k]
-                            self.send(
-                                {
-                                    "joint_pos": f["robot_feedback/joint_pos"][i].tolist(),
-                                    "gripper_pos": f["robot_feedback/gripper_pos"][i].tolist(),
-                                    "target_joint_pos": f["robot_command/target_joint_pos"][
-                                        j
-                                    ].tolist(),
-                                    "target_gripper_pos": f["robot_command/target_gripper_pos"][
-                                        j
-                                    ].tolist(),
-                                }
-                            )
+                            state = {
+                                "joint_pos": f["robot_feedback/joint_pos"][i].tolist(),
+                                "gripper_pos": f["robot_feedback/gripper_pos"][i].tolist(),
+                                "target_joint_pos": f["robot_command/target_joint_pos"][j].tolist(),
+                                "target_gripper_pos": f["robot_command/target_gripper_pos"][j].tolist(),
+                            }
+                            if "tracking_reference_indices" in sync:
+                                from data_collect.calibration.tracking import response_reference_values
+
+                                values, valid = response_reference_values(f, [sync["tracking_reference_indices"][k]])
+                                state["tracking_reference"] = values[0].tolist()
+                                state["tracking_valid"] = valid[0].tolist()
+                                state["tracking_latency_ms"] = [v / 1e6 for v in sync["robot_tracking_latency"]["latency_ns"]]
+                            self.send(state)
                         else:
                             self.send({"preview": "自动 REJECT：原始异步帧预览，仅供诊断"})
                     else:
@@ -183,13 +195,20 @@ def make_review_server(audit_dir, rules, host="127.0.0.1", port=8765):
 
         def do_POST(self):
             try:
-                if self.path != "/api/decision" or self.headers.get("X-Review-Token") != token:
+                if self.path not in ("/api/decision", "/api/rescan") or self.headers.get("X-Review-Token") != token:
                     self.send({"error": "invalid request"}, status=403)
                     return
                 length = int(self.headers.get("Content-Length", 0))
                 if not 0 < length <= 16384:
                     raise ValueError("invalid request size")
                 data = json.loads(self.rfile.read(length))
+                if self.path == "/api/rescan":
+                    from data_collect.dataset.audit import audit_batch
+
+                    with lock:
+                        reports, manifest = audit_batch(raw_dir, audit_dir, rules)
+                    self.send({"episodes": len(reports), "approved_episodes": len(manifest["episodes"])})
+                    return
                 by_name = {r["episode"]: r for r in read_reports()}
                 row = by_name[data["episode"]]
                 decision = data["decision"]
@@ -225,8 +244,8 @@ def make_review_server(audit_dir, rules, host="127.0.0.1", port=8765):
     return ThreadingHTTPServer((host, port), Handler)
 
 
-def serve_review(audit_dir, rules, host="127.0.0.1", port=8765):
-    server = make_review_server(audit_dir, rules, host, port)
+def serve_review(audit_dir, rules, host="127.0.0.1", port=8765, *, raw_dir=None):
+    server = make_review_server(audit_dir, rules, host, port, raw_dir=raw_dir)
     print(f"打开 http://{host}:{server.server_port} 审核；Ctrl-C 退出", flush=True)
     try:
         server.serve_forever()

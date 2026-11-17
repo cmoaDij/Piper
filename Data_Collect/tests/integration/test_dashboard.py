@@ -3,13 +3,13 @@ import threading
 from urllib.request import build_opener, ProxyHandler
 
 from data_collect.common.config import local_path
-from data_collect.web.dashboard import DemoBridge, LaunchSupervisor, make_server
+from data_collect.web.dashboard import DemoBridge, LaunchSupervisor, make_server, reuse_dashboard
 
 
 def test_demo_serves_static_files_models_and_state_without_hardware(config):
     bridge = DemoBridge(config)
     supervisor = LaunchSupervisor(bridge, local_path("config/collection.yaml"), demo=True)
-    server = make_server(config, local_path("config/collection.yaml"), bridge, supervisor, 0, demo=True)
+    server = make_server(config, local_path("config/collection.yaml"), bridge, supervisor, 0, demo=True, can_port="can7")
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     opener = build_opener(ProxyHandler({}))
@@ -21,7 +21,13 @@ def test_demo_serves_static_files_models_and_state_without_hardware(config):
         with opener.open(url + "/api/boot", timeout=3) as response:
             boot = json.load(response)
         assert boot["demo"] and len(boot["model"]["links"]) > 6
-        supervisor.start("can0")
+        assert "safety" not in boot and boot["teleop"]["fast_mode"] is True
+        assert boot["can_port"] == "can7"
+        # Reusing a GUI starts its original supervisor, without a second service.
+        assert reuse_dashboard(server.server_port, local_path("config/collection.yaml"), True, True, True)
+        started_at = supervisor.started_at
+        assert reuse_dashboard(server.server_port, local_path("config/collection.yaml"), True, True, True)
+        assert supervisor.started_at == started_at
         with opener.open(url + "/api/state", timeout=3) as response:
             state = json.load(response)
         assert state["process"]["running"] and supervisor.process is None

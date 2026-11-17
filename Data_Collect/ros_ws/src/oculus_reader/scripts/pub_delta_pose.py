@@ -16,8 +16,8 @@ from rclpy.node import Node
 from rcl_interfaces.msg import ParameterDescriptor
 from scipy.spatial.transform import Rotation
 from sensor_msgs.msg import JointState
-from std_msgs.msg import Bool, Header, String
-from std_srvs.srv import Empty, Trigger
+from std_msgs.msg import Bool, Header
+from std_srvs.srv import Empty
 from transformations import euler_from_quaternion
 
 
@@ -47,6 +47,7 @@ def calc_pose_incre(
     current_pose_matrix,
     zero_matrix: np.ndarray,
     translation_scale: np.ndarray,
+    delta_frame: str = "tcp",
 ):
     end_matrix = xyzrpy_to_mat(
         current_pose_matrix[0],
@@ -56,6 +57,16 @@ def calc_pose_incre(
         current_pose_matrix[4],
         current_pose_matrix[5],
     )
+    if delta_frame == "base":
+        # Both input poses already use the reference Quest -> ROS world axes.
+        # Rebase position and orientation separately: a full SE(3) conjugation
+        # would rotate translation by the arbitrary hand/TCP orientations at A.
+        result_matrix = zero_matrix.copy()
+        result_matrix[:3, 3] += translation_scale * (end_matrix[:3, 3] - start_pose_matrix[:3, 3])
+        result_matrix[:3, :3] = end_matrix[:3, :3] @ start_pose_matrix[:3, :3].T @ zero_matrix[:3, :3]
+        return mat2xyzquat(result_matrix)
+    if delta_frame != "tcp":
+        raise ValueError("delta_frame must be base or tcp")
     relative_matrix = np.dot(np.linalg.inv(start_pose_matrix), end_matrix)
     # Scale the controller displacement in its start-frame axes before mapping
     # it into the current TCP frame.  Rotation mapping is deliberately unchanged.
@@ -74,6 +85,7 @@ class RosOperator(Node):
         self.declare_parameter("delta_pose_topic", "/delta_pose")
         self.declare_parameter("control_joint_topic", "/control/joint_states")
         self.declare_parameter("teleop_enabled_topic", "/teleop/enabled")
+        self.declare_parameter("following_topic", "/teleop/following")
         self.declare_parameter("move_home_service", "/move_home")
 
         # Button mapping parameters
@@ -81,6 +93,7 @@ class RosOperator(Node):
         self.declare_parameter("start_button", "A", dynamic_string_param)
         self.declare_parameter("stop_button", "B", dynamic_string_param)
         self.declare_parameter("reset_button", "RJ", dynamic_string_param)
+        self.declare_parameter("follow_button", "RG", dynamic_string_param)
         self.declare_parameter("trigger_axis", "rightTrig")
 
         # Gripper/control parameters
@@ -89,7 +102,8 @@ class RosOperator(Node):
         self.declare_parameter("control_rate_hz", 30.0)
         self.declare_parameter("hand_name", "right")
         self.declare_parameter("translation_scale", [1.0, 1.0, 1.0])
-        self.declare_parameter("auto_home_on_stop", False)
+        self.declare_parameter("delta_frame", "tcp")
+        self.declare_parameter("auto_home_on_stop", True)
         self.declare_parameter("auto_home_delay_s", 0.5)
         # Empty means that OculusReader selects an ADB USB device.  Keep the
         # existing Wi-Fi endpoint as the default for the original launch files.
@@ -115,9 +129,12 @@ class RosOperator(Node):
         self.reset_button = self._normalize_button_name(
             self.get_parameter("reset_button").value, "reset_button"
         )
-        if len({self.start_button, self.stop_button, self.reset_button}) != 3:
+        self.follow_button = self._normalize_button_name(
+            self.get_parameter("follow_button").value, "follow_button"
+        )
+        if len({self.start_button, self.stop_button, self.reset_button, self.follow_button}) != 4:
             raise ValueError(
-                "start_button, stop_button, and reset_button must be distinct."
+                "start_button, stop_button, reset_button, and follow_button must be distinct."
             )
         self.start_edge = RisingEdge()
         self.stop_edge = RisingEdge()
@@ -135,6 +152,9 @@ class RosOperator(Node):
             )
         control_rate_hz = float(self.get_parameter("control_rate_hz").value)
         self.hand_name = str(self.get_parameter("hand_name").value)
+        self.delta_frame = str(self.get_parameter("delta_frame").value)
+        if self.delta_frame not in ("base", "tcp"):
+            raise ValueError("delta_frame must be base or tcp")
         self.translation_scale = np.asarray(
             self.get_parameter("translation_scale").value, dtype=float
         )
@@ -157,16 +177,13 @@ class RosOperator(Node):
         self.pub_teleop_enabled = self.create_publisher(
             Bool, self.teleop_enabled_topic, 10
         )
+        self.pub_following = self.create_publisher(
+            Bool, str(self.get_parameter("following_topic").value), 10
+        )
         self.move_home_client = self.create_client(Empty, move_home_service)
-        self.prepare_home_client = self.create_client(Trigger, "/data_collect/prepare_home")
+        self.create_subscription(Bool, self.teleop_enabled_topic, self.external_enabled_callback, 10)
         self.home_timer = None
         self.home_future = None
-        self.preparing_home = False
-        self.prepare_cancelled = False
-        self._teleop_start_ros_ns = 0
-        self._handle_received_ros_ns = 0
-        self.create_subscription(String, "/data_collect/status", self.collector_status_callback, 10)
-        self.create_subscription(Bool, self.teleop_enabled_topic, self.external_enabled_callback, 10)
 
         # Callback inputs
         self.x = None
@@ -184,6 +201,8 @@ class RosOperator(Node):
         self.tcp_yaw = None
 
         self.flag = False
+        self.following = False
+        self.follow_requires_release = False
 
         self.create_subscription(PoseStamped, handle_pose_topic, self.handle_pose_callback, 1)
         self.create_subscription(PoseStamped, feedback_tcp_pose_topic, self.tcp_pose_callback, 1)
@@ -202,17 +221,17 @@ class RosOperator(Node):
             f"pub_delta_pose ready ({self.hand_name}). "
             f"transport={'Wi-Fi ADB (' + oculus_ip + ':5555)' if oculus_ip else 'USB ADB'}, "
             f"translation_scale={self.translation_scale.tolist()}, "
+            f"delta_frame={self.delta_frame}, "
             f"handle_topic={handle_pose_topic}, feedback_topic={feedback_tcp_pose_topic}, "
             f"delta_topic={delta_pose_topic}, control_topic={control_joint_topic}, "
             f"teleop_status={self.teleop_enabled_topic}, "
             f"buttons=(start={self.start_button}, stop={self.stop_button}, "
-            f"reset={self.reset_button}), trigger={self.trigger_axis}, "
+            f"reset={self.reset_button}, follow={self.follow_button}), gripper_trigger={self.trigger_axis}, "
             f"auto_home_on_stop={self.auto_home_on_stop}, "
             f"home_service={move_home_service}"
         )
 
     def handle_pose_callback(self, msg: PoseStamped):
-        self._handle_received_ros_ns = self.get_clock().now().nanoseconds
         self.x = msg.pose.position.x
         self.y = msg.pose.position.y
         self.z = msg.pose.position.z
@@ -285,68 +304,38 @@ class RosOperator(Node):
         if self.flag == enabled:
             return
         self.flag = enabled
-        if enabled:
-            self._teleop_start_ros_ns = self.get_clock().now().nanoseconds
         message = Bool()
         message.data = enabled
         self.pub_teleop_enabled.publish(message)
 
+    def _set_following(self, following: bool) -> None:
+        if self.following == following:
+            return
+        self.following = following
+        message = Bool()
+        message.data = following
+        self.pub_following.publish(message)
+
     def external_enabled_callback(self, msg: Bool):
-        if not msg.data:
-            if self.preparing_home:
-                self.prepare_cancelled = True
+        # Our own B=False echo arrives after the home timer was scheduled.
+        # Only an actual external transition out of an active session stops it.
+        if not msg.data and self.flag:
             self._cancel_pending_home()
+            self._set_following(False)
             self._set_teleop_enabled(False)
 
-    def collector_status_callback(self, msg: String):
-        try:
-            status = json.loads(msg.data)
-        except (ValueError, TypeError):
-            return
-        if self.flag and status.get("error") and status.get("status_ros_ns", 0) >= self._teleop_start_ros_ns:
-            self._cancel_pending_home()
-            self._set_teleop_enabled(False)
-            self.get_logger().error(f"采集驱动已拒绝/停止遥操作：{status['error']}")
-
-    def _prepare_start(self):
-        if self.flag or self.preparing_home or self._home_in_progress():
-            self.get_logger().warning("已在遥操作或回零过程中，忽略重复 A；请先按 B 停止")
-            return
-        if self.x is None or not 0 <= self.get_clock().now().nanoseconds - self._handle_received_ros_ns <= 250_000_000:
-            self.get_logger().error("手柄位姿缺失或过期，未请求回零；请恢复追踪后重新按 A")
-            return
-        if not self.prepare_home_client.service_is_ready():
-            self.get_logger().error("/data_collect/prepare_home 服务尚未就绪，未发送运动请求")
-            return
-        self._cancel_pending_home()
-        self.preparing_home = True
-        self.prepare_cancelled = False
-        self.home_future = self.prepare_home_client.call_async(Trigger.Request())
-        self.home_future.add_done_callback(self._prepare_done)
-        self.get_logger().info("A：已请求准备，最多等待 1 秒设备就绪；随后低速回零，确认前不进入遥操作、不录制")
-
-    def _prepare_done(self, future):
-        self.preparing_home = False
-        try:
-            result = future.result()
-            if self.prepare_cancelled:
-                self.get_logger().warning("本次 A 准备已由 B 取消，不启动遥操作")
-                return
-            if not result.success:
-                raise ValueError(result.message)
-            if self.x is None or not 0 <= self.get_clock().now().nanoseconds - self._handle_received_ros_ns <= 250_000_000:
-                raise ValueError("回零已完成，但手柄位姿已过期；保持手柄可追踪并重新按 A")
-            snapshot = json.loads(result.message)
-            tcp = np.asarray(snapshot["tcp_pose"], dtype=float)
-            if tcp.shape != (6,) or not np.isfinite(tcp).all():
-                raise ValueError("回零返回的 TCP 无效")
-            self.start_pose_matrix = xyzrpy_to_mat(self.x, self.y, self.z, self.roll, self.pitch, self.yaw)
-            self.zero_matrix = xyzrpy_to_mat(*tcp)
-            self._set_teleop_enabled(True)
-            self.get_logger().info("回零已确认：已将当前手柄位姿对应到零位 TCP，允许后续增量遥操作")
-        except Exception as exc:
-            self._set_teleop_enabled(False)
-            self.get_logger().error(f"A 键准备失败，未开始遥操作：{exc}")
+    def _log_reference_frames(self):
+        # The reference algorithm maps displacement through the captured hand
+        # and TCP orientations; matching a constant RPY alone is insufficient.
+        hand_to_base = np.diag(self.translation_scale)
+        if self.delta_frame == "tcp":
+            hand_to_base = self.zero_matrix[:3, :3] @ hand_to_base @ self.start_pose_matrix[:3, :3].T
+        self.get_logger().info("遥操参考坐标: " + json.dumps({
+            "delta_frame": self.delta_frame,
+            "hand_reference": self.start_pose_matrix.round(6).tolist(),
+            "tcp_reference": self.zero_matrix.round(6).tolist(),
+            "hand_world_delta_to_base_delta": hand_to_base.round(6).tolist(),
+        }, ensure_ascii=False))
 
     def _reset_teleop_reference(self) -> None:
         """Recenter hand-to-TCP mapping without commanding a return-home motion."""
@@ -360,6 +349,15 @@ class RosOperator(Node):
                 f"[{self.hand_name}] 忽略复位：尚未收到机械臂 TCP 反馈"
             )
             return
+        # RJ also starts a new downstream IK reference; otherwise rebasing the
+        # input alone would be interpreted as motion within the old segment.
+        self._set_following(False)
+        self._capture_reference()
+        self.get_logger().info(
+            f"[{self.hand_name}] 已复位遥操参考位姿，机械臂保持当前位置"
+        )
+
+    def _capture_reference(self) -> None:
         self.start_pose_matrix = xyzrpy_to_mat(
             self.x, self.y, self.z, self.roll, self.pitch, self.yaw
         )
@@ -371,9 +369,7 @@ class RosOperator(Node):
             self.tcp_pitch,
             self.tcp_yaw,
         )
-        self.get_logger().info(
-            f"[{self.hand_name}] 已复位遥操参考位姿，机械臂保持当前位置"
-        )
+        self._log_reference_frames()
 
     def _home_in_progress(self) -> bool:
         return self.home_future is not None and not self.home_future.done()
@@ -443,49 +439,74 @@ class RosOperator(Node):
         gripper_msg.position = [gripper_value]
         self.pub_move_j.publish(gripper_msg)
 
-        if self.reset_edge.update(buttons.get(self.reset_button, False)):
-            if self.x is not None:
-                self._reset_teleop_reference()
-
-        if self.start_edge.update(buttons.get(self.start_button, False)):
-            if self.x is not None:
-                self._prepare_start()
-
+        # B must work even if hand tracking is unavailable or A was never pressed.
+        start_pressed = self.start_edge.update(buttons.get(self.start_button, False))
         if self.stop_edge.update(buttons.get(self.stop_button, False)):
-            if self.preparing_home:
-                self.prepare_cancelled = True
-                self.pub_teleop_enabled.publish(Bool(data=False))
-                self.get_logger().warning("B：已请求取消回零并保持当前位置")
-            was_enabled = self.flag
-            if was_enabled:
-                self.get_logger().info(f"[{self.hand_name}] 停止遥操作")
+            action = "停止遥操作并回零" if self.auto_home_on_stop else "停止遥操作，不自动回零"
+            self.get_logger().info(f"[{self.hand_name}] B：{action}")
+            self._set_following(False)
             self._set_teleop_enabled(False)
-            if self.tcp_x is not None and self.x is not None:
-                self.zero_matrix = xyzrpy_to_mat(
-                    self.tcp_x,
-                    self.tcp_y,
-                    self.tcp_z,
-                    self.tcp_roll,
-                    self.tcp_pitch,
-                    self.tcp_yaw,
-                )
-                self.start_pose_matrix = xyzrpy_to_mat(
-                    self.x, self.y, self.z, self.roll, self.pitch, self.yaw
-                )
-            if was_enabled:
-                self._schedule_home()
+            self._schedule_home()
+            return
 
-        if self.flag and self.x is not None:
-            current_pose = [self.x, self.y, self.z, self.roll, self.pitch, self.yaw]
+        if self.x is None:
+            return
+
+        current_pose = [self.x, self.y, self.z, self.roll, self.pitch, self.yaw]
+
+        if self.reset_edge.update(buttons.get(self.reset_button, False)):
+            self._reset_teleop_reference()
+
+        if start_pressed:
+            if self._home_in_progress():
+                self.get_logger().warning(
+                    f"[{self.hand_name}] 回零尚未完成，忽略开始遥操作请求"
+                )
+            else:
+                self._cancel_pending_home()
+                if self.tcp_x is None:
+                    self.get_logger().warning(
+                        f"[{self.hand_name}] 尚未收到 TCP 反馈，忽略开始遥操作请求"
+                    )
+                else:
+                    self._capture_reference()
+                    self._set_following(False)
+                    self.follow_requires_release = bool(buttons.get(self.follow_button, False))
+                    self.get_logger().info(
+                        f"[{self.hand_name}] A：已对齐当前 TCP；松开后重新按住 {self.follow_button} 才跟随"
+                    )
+                    self._set_teleop_enabled(True)
+
+        if self.flag:
+            follow_requested = bool(buttons.get(self.follow_button, False))
+            if self.follow_requires_release:
+                if not follow_requested:
+                    self.follow_requires_release = False
+                self._set_following(False)
+                return
+            if not follow_requested:
+                if self.following:
+                    self.get_logger().info(f"[{self.hand_name}] 松开 {self.follow_button}：冻结最后下发的关节目标")
+                self._set_following(False)
+                return
+            if not self.following:
+                # Discard paused hand motion. Downstream IK reanchors these
+                # increments at the held joint command to avoid feedback drift.
+                if self.tcp_x is None:
+                    return
+                self._capture_reference()
+                self._set_following(True)
+                self.get_logger().info(f"[{self.hand_name}] 按住 {self.follow_button}：重置手柄参考，连续接入保持目标")
             xyz, quat = calc_pose_incre(
                 self.start_pose_matrix,
                 current_pose,
                 self.zero_matrix,
                 self.translation_scale,
+                self.delta_frame,
             )
             pose_msg = PoseStamped()
             pose_msg.header.stamp = self.get_clock().now().to_msg()
-            pose_msg.header.frame_id = "vr_device"
+            pose_msg.header.frame_id = "base_link"
             pose_msg.pose.position.x = float(xyz[0])
             pose_msg.pose.position.y = float(xyz[1])
             pose_msg.pose.position.z = float(xyz[2])
@@ -497,11 +518,8 @@ class RosOperator(Node):
 
     def destroy_node(self):
         self._cancel_pending_home()
-        if self.preparing_home:
-            self.prepare_cancelled = True
-            if self.context.ok():
-                self.pub_teleop_enabled.publish(Bool(data=False))
         if self.context.ok():
+            self._set_following(False)
             self._set_teleop_enabled(False)
         self.oculus_reader.stop()
         return super().destroy_node()

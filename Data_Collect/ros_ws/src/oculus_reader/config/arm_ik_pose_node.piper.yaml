@@ -26,9 +26,8 @@
     tool_pre_rot_rpy: [0.0, 0.0, 0.0]
     # 工具平移外参（单位 m）：joint6 -> TCP 的平移偏置
     # 调整方法：末端位置存在固定偏差时按实测值调整；无夹爪可设为 [0,0,0]
-    tool_translation_xyz: [0.0, 0.0, 0.113]
+    tool_translation_xyz: [0.0, 0.0, 0.195]
     tcp_offset_rpy: [0.0, 0.0, 0.0]
-    require_start_alignment: true
 
     # 自碰撞检测对（扁平数组 [a,b,c,d] -> (a,b),(c,d)）
     # 调整方法：按 URDF 碰撞体索引配置；误配会导致误报或漏报
@@ -51,9 +50,6 @@
     # 调整建议：增大更平滑但更迟滞；减小更跟手但可能抖动/跳解
     # 平滑项过大时会明显不跟手
     w_smooth: 0.1
-    # TCP 输入每次最多前进 2 mm / 1°；下游关节速度、加速度限制仍生效。
-    max_tcp_step_m: 0.002
-    max_tcp_step_rad: 0.01745329252
     # IPOPT 最大迭代次数
     # 调整建议：解不收敛可增大；实时性不足可减小
     ipopt_max_iter: 50

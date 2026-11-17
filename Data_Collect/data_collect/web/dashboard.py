@@ -22,7 +22,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 from urllib.error import URLError
-from urllib.request import ProxyHandler, build_opener
+from urllib.request import ProxyHandler, Request, build_opener
 
 from data_collect.common.config import ROOT, IMAGE_STREAMS, load_config, local_path
 
@@ -61,13 +61,36 @@ def existing_dashboard(port):
     return None
 
 
-def reuse_dashboard(port, config_path, demo, no_browser):
+def reuse_dashboard(port, config_path, demo, no_browser, start=False, can_port="can0"):
     boot = existing_dashboard(port)
     if boot is None:
         return False
     url = f"http://127.0.0.1:{port}/"
     if boot["demo"] != demo or Path(boot["config"]).resolve() != config_path:
         raise ValueError(f"{url} 已运行另一种模式或配置的工作台；请使用 --port 指定其他端口。")
+    if start:
+        # Use the existing owner's authenticated local API, keeping one ROS graph
+        # observer and one launch process even when start.sh is run twice.
+        opener = build_opener(ProxyHandler({}))
+        try:
+            with opener.open(url + "api/state", timeout=2) as response:
+                running = json.load(response)["process"]["running"]
+            if not running:
+                with opener.open(url, timeout=2) as response:
+                    html = response.read().decode("utf-8")
+                token = re.search(r'<meta name="control-token" content="([^"]+)">', html)
+                if token is None:
+                    raise ValueError("已有工作台未提供控制凭证，请刷新或重启工作台")
+                request = Request(
+                    url + "api/start",
+                    data=json.dumps({"can_port": can_port}).encode("utf-8"),
+                    headers={"Content-Type": "application/json", "X-Control-Token": token.group(1)},
+                    method="POST",
+                )
+                with opener.open(request, timeout=5) as response:
+                    json.load(response)
+        except (URLError, OSError, KeyError) as exc:
+            raise ValueError(f"无法通过已有工作台启动遥操：{exc}") from exc
     print(f"工作台已在运行：{url}\n直接打开已有界面，服务由原进程继续运行。", flush=True)
     if not no_browser:
         webbrowser.open(url)
@@ -213,7 +236,7 @@ class DemoBridge:
             target[1], target[2] = max(0, target[1]), min(0, target[2])
             recording = active and not self.paused and elapsed > 5
             width = .04 + .02 * math.sin(t * .2) if active and not self.paused else self.frozen_width
-            status = {"recording": "演示轨迹（不保存）" if recording else None, "recording_duration_s": max(0, elapsed - 5) if recording else 0, "armed": active and not self.paused and 3 < elapsed <= 5, "homing": active and not self.paused and elapsed <= 3, "aligned": active and not self.paused and elapsed > 3, "teleop_enabled": active and not self.paused and elapsed > 3, "arm_enabled": active, "control_ready": active, "error": None, "robot": {"joint_pos": q, "target_joint_pos": target if active else None, "tcp_pose": self.fk(q).tolist(), "gripper_pos": [width], "age_ms": 4 if active else None, "joint_host_ts_ns": time.monotonic_ns()}, "streams": {name: {"age_ms": 10 + i * 3 if active else None, "fps": (30 if i < 2 else 60) if active else 0} for i, name in enumerate(IMAGE_STREAMS)}, "writer": {"pending_mb": 8.4 if recording else 0, "capacity_mb": 256}, "fk_position_error_m": .00026, "fk_rotation_error_rad": .00003}
+            status = {"recording": "演示轨迹（不保存）" if recording else None, "recording_duration_s": max(0, elapsed - 5) if recording else 0, "armed": active and not self.paused and elapsed <= 5, "homing": False, "aligned": active and not self.paused, "teleop_enabled": active and not self.paused, "arm_enabled": active, "control_ready": active, "error": None, "robot": {"joint_pos": q, "target_joint_pos": target if active else None, "tcp_pose": self.fk(q).tolist(), "gripper_pos": [width], "age_ms": 4 if active else None, "joint_host_ts_ns": time.monotonic_ns()}, "streams": {name: {"age_ms": 10 + i * 3 if active else None, "fps": (30 if i < 2 else 60) if active else 0} for i, name in enumerate(IMAGE_STREAMS)}, "writer": {"pending_mb": 8.4 if recording else 0, "capacity_mb": 256}, "fk_position_error_m": .00026, "fk_rotation_error_rad": .00003}
             return {"collector": status, "collector_age_ms": 0 if active else None, "quest_age_ms": 8 if active else None, "nodes": list(NODES) if active else [], "bridge_error": None, "demo_paused": self.paused}
 
     def close(self):
@@ -273,7 +296,7 @@ class LaunchSupervisor:
             self.process = subprocess.Popen(command, cwd=ROOT, env=env, start_new_session=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, errors="replace", bufsize=1)
             self.returncode, self.started_at = None, time.time()
             self.failure = None
-            self.log(f"启动遥操程序，PID {self.process.pid}，接口 {can_port}；等待手柄 A 回零对齐。")
+            self.log(f"启动遥操程序，PID {self.process.pid}，接口 {can_port}；等待手柄 A 从当前姿态对齐。")
             threading.Thread(target=self._read, args=(self.process, self.log_path), name="dashboard-launch-log", daemon=True).start()
 
     def _read(self, process, log_path):
@@ -370,10 +393,10 @@ class LaunchSupervisor:
             self.stop_thread.join(timeout=29)
 
 
-def make_server(cfg, config_path, bridge, supervisor, port, demo=False):
+def make_server(cfg, config_path, bridge, supervisor, port, demo=False, can_port="can0"):
     model, assets = robot_description(cfg)
     token = secrets.token_urlsafe(32)
-    boot = {"application": "piper-data-collect-dashboard", "demo": demo, "model": model, "safety": cfg["motion"], "nodes": NODES, "streams": list(IMAGE_STREAMS), "config": str(config_path)}
+    boot = {"application": "piper-data-collect-dashboard", "demo": demo, "model": model, "teleop": cfg["teleop"], "can_port": can_port, "nodes": NODES, "streams": list(IMAGE_STREAMS), "config": str(config_path)}
 
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, *args):
@@ -440,7 +463,7 @@ def make_server(cfg, config_path, bridge, supervisor, port, demo=False):
                     supervisor.stop()
                 elif self.path == "/api/hold":
                     bridge.hold()
-                    supervisor.log("已请求停止运动/取消回零（与 B 相同）；程序仍保持运行。")
+                    supervisor.log("已请求停止遥操与录制；程序仍保持运行，界面停止不请求回零。")
                 else:
                     self.send({"error": "接口不存在"}, status=404)
                     return
@@ -459,6 +482,8 @@ def main():
     parser.add_argument("--port", type=int, default=8766)
     parser.add_argument("--demo", action="store_true", help="离线演示，不连接硬件、不保存数据")
     parser.add_argument("--no-browser", action="store_true")
+    parser.add_argument("--start", action="store_true", help="工作台就绪后自动启动遥操程序")
+    parser.add_argument("--can-port", default="can0", help="自动启动时使用的 CAN 接口")
     args = parser.parse_args()
     if not 0 <= args.port <= 65535:
         parser.error("端口须在 0–65535 范围内")
@@ -466,11 +491,11 @@ def main():
         raise KeyboardInterrupt
     signal.signal(signal.SIGTERM, terminate)
     signal.signal(signal.SIGHUP, terminate)
-    if sys.version_info[:2] not in ((3, 10), (3, 11)):
+    if not args.demo and sys.version_info[:2] not in ((3, 10), (3, 11)):
         parser.error(f"请先执行 source {ROOT}/env.sh，使用独立采集环境 Python 3.11")
     cfg, config_path = load_config(args.config), local_path(args.config)
     try:
-        if reuse_dashboard(args.port, config_path, args.demo, args.no_browser):
+        if reuse_dashboard(args.port, config_path, args.demo, args.no_browser, args.start, args.can_port):
             return
     except ValueError as exc:
         parser.exit(1, f"界面启动失败：{exc}\n")
@@ -478,18 +503,23 @@ def main():
     supervisor = LaunchSupervisor(bridge, config_path, args.demo)
     server = None
     try:
-        server = make_server(cfg, config_path, bridge, supervisor, args.port, args.demo)
+        server = make_server(cfg, config_path, bridge, supervisor, args.port, args.demo, args.can_port)
+        if args.start:
+            supervisor.start(args.can_port)
         url = f"http://127.0.0.1:{server.server_port}/"
-        print(f"Piper GUI：{url} {'（离线演示）' if args.demo else '（尚未启动机械臂）'}", flush=True)
+        mode = "（离线演示）" if args.demo else "（遥操程序已请求启动）" if args.start else "（尚未启动机械臂）"
+        print(f"Piper GUI：{url} {mode}", flush=True)
         if not args.no_browser:
             webbrowser.open(url)
         server.serve_forever(poll_interval=.2)
     except KeyboardInterrupt:
         pass
+    except ValueError as exc:
+        parser.exit(1, f"遥操启动失败：{exc}\n")
     except OSError as exc:
         if exc.errno == errno.EADDRINUSE:
             try:
-                if reuse_dashboard(args.port, config_path, args.demo, args.no_browser):
+                if reuse_dashboard(args.port, config_path, args.demo, args.no_browser, args.start, args.can_port):
                     return
             except ValueError as conflict:
                 parser.exit(1, f"界面启动失败：{conflict}\n")

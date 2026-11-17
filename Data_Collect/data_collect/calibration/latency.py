@@ -15,7 +15,8 @@ from pathlib import Path
 import h5py
 import numpy as np
 
-from data_collect.common.config import IMAGE_STREAMS, atomic_json, fingerprint, inside_data_collect, load_config, local_path
+from data_collect.common.config import IMAGE_STREAMS, atomic_json, fingerprint, image_streams, inside_data_collect, load_config, local_path, recorded_image_streams
+from data_collect.recording.images import EpisodeImages
 
 STREAM_NAMES = tuple(s.split("/")[1] for s in IMAGE_STREAMS)
 TIMESTAMP_POLICY = "available_and_aligned_not_after_grid_v1"
@@ -83,14 +84,12 @@ def _series(group):
 
 def _features(group):
     ts, _, rows = _series(group)
-    data = group["data"]
-    if data.ndim != 4 or data.shape[-1] != 3 or len(data) != len(group["frame_id"]):
-        raise ValueError(f"{group.name} 图像格式错误")
     previous, features = None, []
-    for row in rows:
-        frame = data[int(row)][::8, ::8].astype(np.float32)
-        features.append(0.0 if previous is None else float(np.abs(frame - previous).mean()))
-        previous = frame
+    with EpisodeImages(group.file) as images:
+        for row in rows:
+            frame = images.read(group.name.lstrip("/"), int(row))[::8, ::8].astype(np.float32)
+            features.append(0.0 if previous is None else float(np.abs(frame - previous).mean()))
+            previous = frame
     return ts, np.asarray(features)
 
 
@@ -145,32 +144,34 @@ def measure(path, events=None, reference="latest", max_ms=500., min_score=.65):
         if not file.attrs.get("complete") or file.attrs.get("collection_error") or file.attrs.get("dropped_samples", 0):
             raise ValueError("标定需要完整、无采集错误、无丢样的原始文件")
         recorded = stored_calibration(file)
+        streams = recorded_image_streams(file)
+        names = tuple(s.split("/")[-1] for s in streams)
         quality = {}
         if events:
-            # Each event must describe the SAME physical instant in all four streams.
+            # Each event must describe the SAME physical instant in every selected stream.
             rows = {}
             with local_path(events).open(encoding="utf-8-sig", newline="") as source:
                 for row in csv.DictReader(source):
                     name = row["stream"].split("/")[-1]
-                    if name not in STREAM_NAMES or not row["event_id"].strip():
+                    if name not in names or not row["event_id"].strip():
                         raise ValueError("事件 CSV 的 stream 或 event_id 非法")
                     event = rows.setdefault(row["event_id"], {})
                     if name in event:
                         raise ValueError("同一个事件和传感器被重复标注")
-                    ts, ids, _ = _series(file[IMAGE_STREAMS[STREAM_NAMES.index(name)]])
+                    ts, ids, _ = _series(file[streams[names.index(name)]])
                     match = np.flatnonzero(ids == int(row["frame_id"]))
                     if len(match) != 1:
                         raise ValueError(f"找不到唯一 frame_id: {name}/{row['frame_id']}")
                     event[name] = int(ts[match[0]])
-            if len(rows) < 5 or any(set(row) != set(STREAM_NAMES) for row in rows.values()):
-                raise ValueError("至少标注 5 个事件，每个事件须包含四路帧")
-            marks = np.asarray([[row[n] for n in STREAM_NAMES] for row in rows.values()], dtype=np.int64)
-            if any(np.any(np.diff(marks[:, i]) <= 0) for i in range(4)):
+            if len(rows) < 5 or any(set(row) != set(names) for row in rows.values()):
+                raise ValueError("至少标注 5 个事件，每个事件须包含所有已选图像流")
+            marks = np.asarray([[row[n] for n in names] for row in rows.values()], dtype=np.int64)
+            if any(np.any(np.diff(marks[:, i]) <= 0) for i in range(len(names))):
                 raise ValueError("事件须按发生顺序标注，且不能重复使用同一帧")
             delays = np.median(marks - marks[:, :1], axis=0)
-            ref = int(np.argmax(delays)) if reference == "latest" else STREAM_NAMES.index(reference)
+            ref = int(np.argmax(delays)) if reference == "latest" else names.index(reference)
             offsets = {}
-            for i, name in enumerate(STREAM_NAMES):
+            for i, name in enumerate(names):
                 differences = marks[:, ref] - marks[:, i]
                 offset = int(round(float(np.median(differences))))
                 residual = float(np.percentile(np.abs(differences-offset), 95) / 1e6)
@@ -180,23 +181,24 @@ def measure(path, events=None, reference="latest", max_ms=500., min_score=.65):
                 quality[name] = {"events": len(rows), "residual_p95_ms": residual}
             method = "shared_event_frame_ids"
         else:
-            features = {name: _features(file[stream]) for name, stream in zip(STREAM_NAMES, IMAGE_STREAMS)}
+            features = {name: _features(file[stream]) for name, stream in zip(names, streams)}
             delays = [0]
-            quality[STREAM_NAMES[0]] = {"correlation": 1.}
-            for name in STREAM_NAMES[1:]:
-                lag, quality[name] = _scan_delay(features[STREAM_NAMES[0]], features[name], max_ms, min_score)
+            quality[names[0]] = {"correlation": 1.}
+            for name in names[1:]:
+                lag, quality[name] = _scan_delay(features[names[0]], features[name], max_ms, min_score)
                 delays.append(lag)
-            ref = int(np.argmax(delays)) if reference == "latest" else STREAM_NAMES.index(reference)
-            offsets = {name: int(delays[ref] - lag) for name, lag in zip(STREAM_NAMES, delays)}
+            ref = int(np.argmax(delays)) if reference == "latest" else names.index(reference)
+            offsets = {name: int(delays[ref] - lag) for name, lag in zip(names, delays)}
             method = "shared_change_cross_correlation"
         result = {
             "schema_version": "piper_latency_v1", "measured_at": datetime.now(timezone.utc).isoformat(),
             "method": method, "source_path": str(path), "source_sha256": fingerprint(path),
-            "reference_stream": STREAM_NAMES[ref], "relative_offsets_ns": offsets,
+            "reference_stream": names[ref], "relative_offsets_ns": offsets,
             "sign_convention": "aligned_host_ts_ns = available_host_ts_ns + relative_offsets_ns",
             "quality": quality, "timestamp_policy": TIMESTAMP_POLICY,
             "camera_serials": recorded.get("camera_serials"), "tactile_ids": recorded.get("tactile_ids"),
             "absolute_latency_measured": False,
+            "camera_mode": json.loads(file.attrs.get("config", "{}")).get("camera_mode", "realsense"),
         }
         if events:
             result.update(events_path=str(local_path(events)), events_sha256=fingerprint(local_path(events)))
@@ -208,18 +210,23 @@ def record(cfg, output, seconds):
     """Images only: no ROS, CAN, arm connection, enabling or motion commands."""
     from data_collect.sensors.capture import CaptureRuntime, CaptureWriter
     from data_collect.recording.storage import EpisodeManager
+    from data_collect.sensors.camera_selection import resolve_cameras, load_gopro_latency
 
     if not 10 <= seconds <= 120:
         raise ValueError("标定录制时长须在 10–120 秒")
     output = inside_data_collect(output)
     if output.suffix != ".h5" or output.exists() or output.with_suffix(".h5.partial").exists():
         raise ValueError("输出须为未占用的 .h5 路径")
+    resolve_cameras(cfg)
+    for options in cfg["cameras"].values():
+        if options.get("backend") == "gopro":
+            load_gopro_latency(options)
+    cfg["calibration"] = json.loads(local_path(cfg["calibration_file"]).read_text(encoding="utf-8"))
+    image_offsets(cfg["calibration"])
     output.parent.mkdir(parents=True, exist_ok=True)
     reservation = output.with_suffix(".reserve")
     with reservation.open("x"):
         pass
-    cfg["calibration"] = json.loads(local_path(cfg["calibration_file"]).read_text(encoding="utf-8"))
-    image_offsets(cfg["calibration"])
     manager = EpisodeManager(cfg)
     runtime = CaptureRuntime(cfg, manager)
     started = False
@@ -234,7 +241,7 @@ def record(cfg, output, seconds):
                 raise RuntimeError("四路图像/触觉基线等待超时")
             time.sleep(.02)
         with manager.lock:
-            for stream in IMAGE_STREAMS:
+            for stream in image_streams(cfg):
                 age = time.monotonic_ns() - int(manager.latest[stream]["available_host_ts_ns"])
                 limit = cfg["audit"]["rgb_red_ms" if stream.startswith("cameras/") else "tactile_red_ms"] * 1e6
                 if not 0 <= age <= limit:
@@ -246,7 +253,7 @@ def record(cfg, output, seconds):
                 "config": cfg, "simulated": False,
             }
             manager.current = CaptureWriter(runtime, output, metadata, cfg["queue_max_items"], int(cfg["queue_max_mb"]*1024**2))
-        print(f"开始四路图像标定录制，{seconds:g} 秒；机械臂未连接。请制造至少 5 次不等间隔共同事件。", flush=True)
+        print(f"开始 {len(image_streams(cfg))} 路图像标定录制，{seconds:g} 秒；机械臂未连接。请制造至少 5 次不等间隔共同事件。", flush=True)
         deadline = time.monotonic() + seconds
         while time.monotonic() < deadline:
             if manager.failure:
@@ -266,7 +273,7 @@ def record(cfg, output, seconds):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="四路图像相对延迟测量；偏移用于离线因果时间补偿")
+    parser = argparse.ArgumentParser(description="已选相机/触觉图像相对延迟测量；不代替 GoPro 绝对接收延迟标定")
     parser.add_argument("--config", default="config/collection.yaml")
     commands = parser.add_subparsers(dest="command", required=True)
     recording = commands.add_parser("record", help="仅录制图像，不连接机械臂")
@@ -291,7 +298,8 @@ def main():
                 raise ValueError("搜索范围须为 50–5000 ms，相关性门限须为 0.1–1")
             result = measure(args.input, args.events, args.reference, args.max_delay_ms, args.min_correlation)
             if args.write:
-                target = local_path(cfg["calibration_file"])
+                profile_config = cfg["camera_selection"]["gopro"] if result.get("camera_mode") == "gopro" else cfg
+                target = local_path(profile_config["calibration_file"])
                 profile = json.loads(target.read_text(encoding="utf-8"))
                 check_devices(profile, result)
                 profile["relative_offsets_ns"] = result["relative_offsets_ns"]
