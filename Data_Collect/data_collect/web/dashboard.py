@@ -61,7 +61,7 @@ def existing_dashboard(port):
     return None
 
 
-def reuse_dashboard(port, config_path, demo, no_browser, start=False, can_port="can0"):
+def reuse_dashboard(port, config_path, demo, no_browser, start=False, can_port="can0", coordinate_mode=None):
     boot = existing_dashboard(port)
     if boot is None:
         return False
@@ -74,7 +74,11 @@ def reuse_dashboard(port, config_path, demo, no_browser, start=False, can_port="
         opener = build_opener(ProxyHandler({}))
         try:
             with opener.open(url + "api/state", timeout=2) as response:
-                running = json.load(response)["process"]["running"]
+                current = json.load(response)
+                running = current["process"]["running"]
+                current_mode = current.get("collector", {}).get("coordinate_mode") or current["process"].get("coordinate_mode")
+                if running and coordinate_mode and current_mode != coordinate_mode:
+                    raise ValueError("已有程序正在使用另一种坐标模式，请先点击「停止程序并保存」，再选择模式重新启动。")
             if not running:
                 with opener.open(url, timeout=2) as response:
                     html = response.read().decode("utf-8")
@@ -83,7 +87,7 @@ def reuse_dashboard(port, config_path, demo, no_browser, start=False, can_port="
                     raise ValueError("已有工作台未提供控制凭证，请刷新或重启工作台")
                 request = Request(
                     url + "api/start",
-                    data=json.dumps({"can_port": can_port}).encode("utf-8"),
+                    data=json.dumps({"can_port": can_port, "coordinate_mode": coordinate_mode}).encode("utf-8"),
                     headers={"Content-Type": "application/json", "X-Control-Token": token.group(1)},
                     method="POST",
                 )
@@ -153,6 +157,7 @@ class RosBridge:
         self.stop_pub = self.node.create_publisher(Bool, "/teleop/enabled", 10)
         self.node.create_subscription(String, "/data_collect/status", self._status, 1)
         self.node.create_subscription(PoseStamped, "/right_handle_pose", self._quest, 1)
+        self.node.create_subscription(String, "/quest/world_input", self._quest_world, 1)
         self.node.create_timer(0.5, self._graph)
         self.executor = SingleThreadedExecutor(context=self.context)
         self.executor.add_node(self.node)
@@ -179,6 +184,16 @@ class RosBridge:
     def _quest(self, msg):
         with self.lock:
             self.quest_received = time.monotonic()
+
+    def _quest_world(self, msg):
+        from data_collect.control.quest_world import WorldInputState
+        try:
+            state = WorldInputState()
+            state.update(msg.data)
+            if state.valid():
+                self._quest(msg)
+        except (ValueError, KeyError, TypeError):
+            pass
 
     def _graph(self):
         with self.lock:
@@ -251,6 +266,7 @@ class LaunchSupervisor:
         self.logs, self.sequence, self.started_at, self.demo_running = deque(maxlen=600), 0, None, False
         self.stop_thread = None
         self.failure = None
+        self.coordinate_mode = load_config(config_path)["teleop"]["coordinate_mode"]
 
     def log(self, message):
         with self.lock:
@@ -273,12 +289,16 @@ class LaunchSupervisor:
                 continue
         return None
 
-    def start(self, can_port):
+    def start(self, can_port, coordinate_mode=None):
         if not re.fullmatch(r"(?:v?can)[0-9]{1,3}", can_port):
             raise ValueError("CAN 接口应为 can0、can1 或 vcan0 等名称")
+        coordinate_mode = coordinate_mode or self.coordinate_mode
+        if coordinate_mode not in ("relative", "world"):
+            raise ValueError("坐标模式必须为 relative/world")
         with self.lock:
             if self.stopping or (self.process and self.process.poll() is None) or self.demo_running:
                 raise ValueError("程序已经启动或正在停止")
+            self.coordinate_mode = coordinate_mode
             if self.demo:
                 self.bridge.start()
                 self.demo_running, self.started_at = True, time.time()
@@ -292,11 +312,12 @@ class LaunchSupervisor:
             directory.mkdir(parents=True, exist_ok=True)
             self.log_path = directory / (datetime.now().strftime("%Y%m%d-%H%M%S-%f") + ".log")
             command = [sys.executable, str(Path(sys.executable).parent / "ros2"), "launch", "./launch/collect.launch.py", f"config:={self.config_path}", f"can_port:={can_port}"]
+            command.append(f"coordinate_mode:={coordinate_mode}")
             env = {**os.environ, "PYTHONUNBUFFERED": "1", "RCUTILS_COLORIZED_OUTPUT": "0"}
             self.process = subprocess.Popen(command, cwd=ROOT, env=env, start_new_session=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, errors="replace", bufsize=1)
             self.returncode, self.started_at = None, time.time()
             self.failure = None
-            self.log(f"启动遥操程序，PID {self.process.pid}，接口 {can_port}；等待手柄 A 从当前姿态对齐。")
+            self.log(f"启动遥操程序，PID {self.process.pid}，接口 {can_port}，坐标模式 {coordinate_mode}；等待手柄 A 从当前姿态对齐。")
             threading.Thread(target=self._read, args=(self.process, self.log_path), name="dashboard-launch-log", daemon=True).start()
 
     def _read(self, process, log_path):
@@ -384,7 +405,7 @@ class LaunchSupervisor:
     def snapshot(self, after_log=0):
         with self.lock:
             running = self.demo_running if self.demo else bool(self.process and self.process.poll() is None)
-            return {"running": running, "stopping": self.stopping, "pid": self.process.pid if running and self.process else None, "returncode": self.returncode, "error": self.failure, "started_at": self.started_at, "log_path": str(self.log_path) if self.log_path else None, "logs": [row for row in self.logs if row["id"] > after_log], "log_cursor": self.sequence}
+            return {"running": running, "coordinate_mode": self.coordinate_mode, "stopping": self.stopping, "pid": self.process.pid if running and self.process else None, "returncode": self.returncode, "error": self.failure, "started_at": self.started_at, "log_path": str(self.log_path) if self.log_path else None, "logs": [row for row in self.logs if row["id"] > after_log], "log_cursor": self.sequence}
 
     def close(self):
         if self.demo_running or self.process:
@@ -458,7 +479,7 @@ def make_server(cfg, config_path, bridge, supervisor, port, demo=False, can_port
                 if not isinstance(body, dict):
                     raise ValueError("请求格式错误")
                 if self.path == "/api/start":
-                    supervisor.start(str(body.get("can_port", "can0")))
+                    supervisor.start(str(body.get("can_port", "can0")), body.get("coordinate_mode"))
                 elif self.path == "/api/stop":
                     supervisor.stop()
                 elif self.path == "/api/hold":
@@ -484,6 +505,7 @@ def main():
     parser.add_argument("--no-browser", action="store_true")
     parser.add_argument("--start", action="store_true", help="工作台就绪后自动启动遥操程序")
     parser.add_argument("--can-port", default="can0", help="自动启动时使用的 CAN 接口")
+    parser.add_argument("--coordinate-mode", choices=("relative", "world"), help="启动坐标模式，可在停止后从界面切换")
     args = parser.parse_args()
     if not 0 <= args.port <= 65535:
         parser.error("端口须在 0–65535 范围内")
@@ -494,13 +516,16 @@ def main():
     if not args.demo and sys.version_info[:2] not in ((3, 10), (3, 11)):
         parser.error(f"请先执行 source {ROOT}/env.sh，使用独立采集环境 Python 3.11")
     cfg, config_path = load_config(args.config), local_path(args.config)
+    if args.coordinate_mode:
+        cfg["teleop"]["coordinate_mode"] = args.coordinate_mode
     try:
-        if reuse_dashboard(args.port, config_path, args.demo, args.no_browser, args.start, args.can_port):
+        if reuse_dashboard(args.port, config_path, args.demo, args.no_browser, args.start, args.can_port, args.coordinate_mode):
             return
     except ValueError as exc:
         parser.exit(1, f"界面启动失败：{exc}\n")
     bridge = DemoBridge(cfg) if args.demo else RosBridge()
     supervisor = LaunchSupervisor(bridge, config_path, args.demo)
+    supervisor.coordinate_mode = cfg["teleop"]["coordinate_mode"]
     server = None
     try:
         server = make_server(cfg, config_path, bridge, supervisor, args.port, args.demo, args.can_port)
@@ -519,7 +544,7 @@ def main():
     except OSError as exc:
         if exc.errno == errno.EADDRINUSE:
             try:
-                if reuse_dashboard(args.port, config_path, args.demo, args.no_browser, args.start, args.can_port):
+                if reuse_dashboard(args.port, config_path, args.demo, args.no_browser, args.start, args.can_port, args.coordinate_mode):
                     return
             except ValueError as conflict:
                 parser.exit(1, f"界面启动失败：{conflict}\n")

@@ -1,6 +1,6 @@
 import json
 import threading
-from urllib.request import build_opener, ProxyHandler
+from urllib.request import build_opener, ProxyHandler, Request
 
 from data_collect.common.config import local_path
 from data_collect.web.dashboard import DemoBridge, LaunchSupervisor, make_server, reuse_dashboard
@@ -31,6 +31,17 @@ def test_demo_serves_static_files_models_and_state_without_hardware(config):
         with opener.open(url + "/api/state", timeout=3) as response:
             state = json.load(response)
         assert state["process"]["running"] and supervisor.process is None
+        supervisor.stop()
+        with opener.open(url, timeout=3) as response:
+            import re
+            html = response.read().decode()
+            assert 'id="coordinate-mode"' in html
+            token = re.search(r'<meta name="control-token" content="([^"]+)">', html).group(1)
+        request = Request(url + "/api/start", data=json.dumps({"can_port": "can7", "coordinate_mode": "world"}).encode(),
+                          headers={"Content-Type": "application/json", "X-Control-Token": token}, method="POST")
+        with opener.open(request, timeout=3) as response:
+            assert response.status == 200
+        assert supervisor.snapshot()["coordinate_mode"] == "world"
     finally:
         server.shutdown()
         server.server_close()

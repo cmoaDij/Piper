@@ -204,6 +204,133 @@ def test_a_rebases_at_current_tcp_without_home_and_rebases_again_after_b(operato
     assert poses[-1].pose.position.x == pytest.approx(.6)
 
 
+def test_world_a_rg_rebase_without_rotating_axes_and_loss_disables_following(operator):
+    import time
+    from data_collect.control.quest_world import PROTOCOL, WorldInputState
+
+    node = operator.node
+    node.coordinate_mode, node.delta_frame = "world", "base"
+    node.world_input, node.world_input_error = WorldInputState(), None
+    metadata = []
+    node.pub_coordinate_status = NS(publish=lambda msg: metadata.append(msg.data))
+    packet = {"protocol": PROTOCOL, "space": "LOCAL", "session": 1, "generation": 1,
+              "seq": 0, "device_monotonic_ns": 1, "valid": True,
+              "grip": [0., 1., 0., 0., 0., 0., 1.], "aim": [0., 1., 0., 0., 0., 0., 1.],
+              "buttons": {"A": True, "B": False, "RG": False, "RJ": False, "rightTrig": 0.}}
+    def send():
+        packet["seq"] += 1
+        packet["host_monotonic_ns"] = time.monotonic_ns()
+        node.world_input_callback(NS(data=__import__('json').dumps(packet)))
+        node.control_loop()
+    send()
+    rotation = node.world_input.rotation.copy()
+    assert node.flag and not node.following
+    packet["buttons"].update(A=False, RG=True)
+    send()
+    packet["grip"][2] -= .02
+    send()
+    assert operator.poses[-1].pose.position.x == pytest.approx(.42)
+    packet["buttons"]["RG"] = False
+    send()
+    packet["aim"][3:] = Rotation.from_euler("y", 1.2).as_quat().tolist()
+    packet["grip"][3:] = Rotation.from_euler("xyz", [.4, .7, -.2]).as_quat().tolist()
+    packet["buttons"]["A"] = True
+    send()
+    np.testing.assert_allclose(node.world_input.rotation, rotation)
+    packet["buttons"].update(A=False, RG=True)
+    send()
+    packet["valid"] = False
+    count = len(operator.poses)
+    send()
+    assert not node.flag and not node.following and len(operator.poses) == count
+    packet["valid"] = True
+    send()
+    assert not node.flag  # Recovery cannot re-engage RG until A and RG release.
+    packet["generation"] = 2
+    send()
+    assert node.world_input.rotation is None
+    assert metadata
+
+
+@pytest.fixture
+def world_operator(operator):
+    import json
+    import time
+    from data_collect.control.quest_world import PROTOCOL, WorldInputState
+
+    node = operator.node
+    node.coordinate_mode, node.delta_frame = "world", "base"
+    node.world_input, node.world_input_error = WorldInputState(), None
+    node.pub_coordinate_status = NS(publish=lambda msg: None)
+    messages = []
+    node.get_logger = lambda: NS(info=messages.append, warning=messages.append, error=messages.append)
+    packet = {"protocol": PROTOCOL, "space": "LOCAL", "session": 1, "generation": 1,
+              "seq": 0, "device_monotonic_ns": 1, "valid": True,
+              "grip": [0., 1., 0., 0., 0., 0., 1.], "aim": [0., 1., 0., 0., 0., 0., 1.],
+              "buttons": {"A": False, "B": False, "RG": False, "RJ": False, "rightTrig": 0.}}
+    def send():
+        packet["seq"] += 1
+        packet["host_monotonic_ns"] = time.monotonic_ns()
+        node.world_input_callback(NS(data=json.dumps(packet)))
+        node.control_loop()
+    operator.packet, operator.send, operator.messages = packet, send, messages
+    return operator
+
+
+def test_world_a_rejection_is_visible_and_recovery_requires_a_new_press(world_operator):
+    case = world_operator
+    case.packet.update(valid=False, tracking={"focused": True, "grip_active": False})
+    case.packet["buttons"]["A"] = True
+    case.send()
+    assert any("A 已收到" in s for s in case.messages)
+    assert any("A 未接入" in s and "右手柄未激活" in s for s in case.messages)
+    assert not case.node.flag and not case.poses
+
+    case.packet["valid"] = True
+    case.send()  # Holding A through recovery may not start motion/control.
+    assert not case.node.flag
+    assert any("世界输入就绪" in s for s in case.messages)
+    case.packet["buttons"]["A"] = False
+    case.send()
+    case.packet["buttons"]["A"] = True
+    case.send()
+    assert case.node.flag and not case.node.following and not case.poses
+    assert any("A：已对齐当前 TCP" in s for s in case.messages)
+
+
+def test_world_input_wait_remains_visible_until_tracking_recovers(world_operator):
+    case = world_operator
+    case.packet.update(valid=False, tracking={"focused": True, "grip_active": False})
+    case.send()
+    case.messages.clear()
+    case.node.log_world_input_status()
+    assert any(s.startswith("[状态] Quest 未就绪") and "右手柄未激活" in s for s in case.messages)
+    assert not case.node.flag and not case.poses
+    case.packet["valid"] = True
+    case.send()
+    case.messages.clear()
+    case.node.log_world_input_status()
+    assert not case.messages
+
+
+def test_world_ready_is_reported_even_if_first_packet_is_already_valid(world_operator):
+    case = world_operator
+    case.send()
+    case.send()
+    assert sum("世界输入就绪" in s for s in case.messages) == 1
+
+
+def test_world_b_still_requests_home_while_pose_is_invalid(world_operator):
+    case = world_operator
+    case.node.auto_home_on_stop = True
+    case.packet.update(valid=False, tracking={"grip": False})
+    case.packet["buttons"]["B"] = True
+    case.send()
+    assert not case.node.flag and not case.poses
+    assert len(case.timers) == 1
+    assert any("B：停止遥操作并回零" in s for s in case.messages)
+
+
 def test_grip_pauses_and_resumes_at_actual_tcp_discarding_paused_hand_motion(operator):
     node, buttons, poses = operator.node, operator.buttons, operator.poses
     buttons["RG"] = True
@@ -557,6 +684,28 @@ def test_console_status_shows_active_duration_and_missing_device(ros_scripts, co
     node.log_diagnostics()
     assert sum("[采集] 已保存" in s for s in messages) == 1
     assert not any("封盘失败" in s for s in messages)
+
+
+def test_teleop_only_status_distinguishes_disabled_recording_from_device_failure(config, monkeypatch):
+    from collections import deque
+
+    messages = []
+    feedback = {name + "_available_host_ts_ns": 1_990_000_000 for name in ("joint", "tcp", "gripper")}
+    def unexpected_sensor_check():
+        pytest.fail("纯遥操不能要求未启用的传感器就绪")
+    manager = NS(lock=threading.RLock(), latest={"robot_feedback": feedback},
+                 current=None, finished=[], require_ready=unexpected_sensor_check,
+                 stream_times={"cameras/wrist_rgb": deque(), "tactile/right_raw": deque()})
+    observer = NS(timings=NS(snapshot=lambda: {}))
+    node_class = collector.build_driver_class(object, config, manager, observer, teleop_only=True)
+    node = node_class.__new__(node_class)
+    node.runtime, node.executor, node.reported_files = NS(capture=None), NS(), set()
+    node.get_logger = lambda: NS(info=messages.append, error=messages.append)
+    monkeypatch.setattr(collector.time, "monotonic_ns", lambda: 2_000_000_000)
+    node.log_diagnostics()
+    line = next(s for s in messages if s.startswith("[状态]"))
+    assert "仅遥操（不录制）" in line and "机器人反馈就绪" in line
+    assert "手腕" not in line and "触觉" not in line
 
 
 @pytest.mark.parametrize("override", [{"speed_percent": 25}, {"fast_mode": False},

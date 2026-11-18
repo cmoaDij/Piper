@@ -9,7 +9,9 @@ function fault(value){return Array.isArray(value)?value.filter(Boolean).join('�
 function toast(message){text('toast',message);$('toast').hidden=false;clearTimeout(toast.timer);toast.timer=setTimeout(()=>$('toast').hidden=true,6000)}
 function phase(label,kind=''){text('phase',label);$('phase').className='phase '+kind;$('run-indicator').className='run-indicator '+kind}
 function fit(canvas){const r=canvas.getBoundingClientRect(),scale=Math.min(devicePixelRatio,2);if(canvas.width!==Math.round(r.width*scale)||canvas.height!==Math.round(r.height*scale)){canvas.width=Math.round(r.width*scale);canvas.height=Math.round(r.height*scale)}const ctx=canvas.getContext('2d');ctx.setTransform(scale,0,0,scale,0,0);return {ctx,w:r.width,h:r.height}}
+function coordinateHint(){text('coordinate-hint',$('coordinate-mode').value==='world'?'首次 A：手柄水平指向基座 +X，锁定方向。此后 A/RG/RJ 只重设起点；更换模式须先停止程序。':'沿用头显相对位姿与 TCP 局部增量。更换模式须先停止程序。')}
 function prepareUI(){
+ $('coordinate-mode').value=boot.teleop.coordinate_mode||'relative';$('coordinate-mode').onchange=coordinateHint;coordinateHint();
  $('can-port').value=boot.can_port||'can0';
  for(const [stream,[name,type]] of Object.entries(labels)){
   const row=document.createElement('div');row.className='sensor';row.dataset.stream=stream;
@@ -31,10 +33,10 @@ function prepareUI(){
 }
 async function action(name){
  if(pendingAction)return;pendingAction=true;updateButtons();
- try{const response=await fetch('/api/'+name,{method:'POST',headers:{'Content-Type':'application/json','X-Control-Token':document.querySelector('meta[name=control-token]').content},body:JSON.stringify({can_port:$('can-port').value})});const result=await response.json();if(!response.ok)throw Error(result.error||'操作失败');toast(name==='start'?(boot.demo?'演示已启动':'程序正在启动，准备就绪后请按手柄 A 从当前姿态对齐'):name==='hold'?'已请求停止遥操':'正在停止进程并等待数据封盘');localMessage='';if(name==='start'){samples=[];previous=null;lastRobotStamp=0;viewer?.clearPath()}}
+ try{const response=await fetch('/api/'+name,{method:'POST',headers:{'Content-Type':'application/json','X-Control-Token':document.querySelector('meta[name=control-token]').content},body:JSON.stringify({can_port:$('can-port').value,coordinate_mode:$('coordinate-mode').value})});const result=await response.json();if(!response.ok)throw Error(result.error||'操作失败');toast(name==='start'?(boot.demo?'演示已启动':'程序正在启动，准备就绪后请按手柄 A 从当前姿态对齐'):name==='hold'?'已请求停止遥操':'正在停止进程并等待数据封盘');localMessage='';if(name==='start'){samples=[];previous=null;lastRobotStamp=0;viewer?.clearPath()}}
  catch(error){localMessage=error.message;toast(error.message)}finally{pendingAction=false;updateButtons()}
 }
-function updateButtons(){const p=state?.process,age=state?.collector_age_ms,online=age!=null&&age<600,external=state?.nodes?.includes('agx_arm_ctrl_single_node');$('start').disabled=pendingAction||!!p?.running||!!p?.stopping||online||external;$('stop').disabled=pendingAction||!p?.running||!!p?.stopping;$('hold').disabled=pendingAction||!(online||p?.running||external);$('can-port').disabled=pendingAction||!!p?.running||online}
+function updateButtons(){const p=state?.process,age=state?.collector_age_ms,online=age!=null&&age<600,external=state?.nodes?.includes('agx_arm_ctrl_single_node');$('start').disabled=pendingAction||!!p?.running||!!p?.stopping||online||external;$('stop').disabled=pendingAction||!p?.running||!!p?.stopping;$('hold').disabled=pendingAction||!(online||p?.running||external);$('can-port').disabled=pendingAction||!!p?.running||online||external;$('coordinate-mode').disabled=$('can-port').disabled;const mode=online?state.collector?.coordinate_mode:p?.running?p.coordinate_mode:null;if(mode){$('coordinate-mode').value=mode;coordinateHint()}}
 function visibleLogs(){return logs.filter(row=>!$('log-errors').checked||/error|failed|exception|warning|warn|故障|失败|异常|拒绝|超时|停止|取消/i.test(row.text))}
 async function copyLogs(){
  const rows=visibleLogs();if(!rows.length){toast('当前没有可复制的日志');return}

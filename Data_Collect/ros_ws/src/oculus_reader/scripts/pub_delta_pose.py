@@ -12,11 +12,12 @@ from gripper_mapping import gripper_position_from_trigger
 from oculus_reader import OculusReader
 from rclpy.executors import ExternalShutdownException
 from data_collect.common.executor import TeleopExecutor
+from data_collect.control.quest_world import WorldInputState
 from rclpy.node import Node
 from rcl_interfaces.msg import ParameterDescriptor
 from scipy.spatial.transform import Rotation
 from sensor_msgs.msg import JointState
-from std_msgs.msg import Bool, Header
+from std_msgs.msg import Bool, Header, String
 from std_srvs.srv import Empty
 from transformations import euler_from_quaternion
 
@@ -103,6 +104,7 @@ class RosOperator(Node):
         self.declare_parameter("hand_name", "right")
         self.declare_parameter("translation_scale", [1.0, 1.0, 1.0])
         self.declare_parameter("delta_frame", "tcp")
+        self.declare_parameter("coordinate_mode", "relative")
         self.declare_parameter("auto_home_on_stop", True)
         self.declare_parameter("auto_home_delay_s", 0.5)
         # Empty means that OculusReader selects an ADB USB device.  Keep the
@@ -153,6 +155,11 @@ class RosOperator(Node):
         control_rate_hz = float(self.get_parameter("control_rate_hz").value)
         self.hand_name = str(self.get_parameter("hand_name").value)
         self.delta_frame = str(self.get_parameter("delta_frame").value)
+        self.coordinate_mode = str(self.get_parameter("coordinate_mode").value)
+        if self.coordinate_mode not in ("relative", "world"):
+            raise ValueError("coordinate_mode must be relative or world")
+        if self.coordinate_mode == "world" and self.delta_frame != "base":
+            raise ValueError("世界坐标模式必须使用 delta_frame=base")
         if self.delta_frame not in ("base", "tcp"):
             raise ValueError("delta_frame must be base or tcp")
         self.translation_scale = np.asarray(
@@ -204,10 +211,17 @@ class RosOperator(Node):
         self.following = False
         self.follow_requires_release = False
 
-        self.create_subscription(PoseStamped, handle_pose_topic, self.handle_pose_callback, 1)
+        self.world_input = WorldInputState() if self.coordinate_mode == "world" else None
+        self.world_input_error = None
+        self.world_input_ready = False
+        self.pub_coordinate_status = self.create_publisher(String, "/teleop/coordinate_status", 10)
+        if self.world_input is None:
+            self.create_subscription(PoseStamped, handle_pose_topic, self.handle_pose_callback, 1)
+        else:
+            self.create_subscription(String, "/quest/world_input", self.world_input_callback, 1)
         self.create_subscription(PoseStamped, feedback_tcp_pose_topic, self.tcp_pose_callback, 1)
 
-        self.oculus_reader = OculusReader(ip_address=oculus_ip or None)
+        self.oculus_reader = OculusReader(ip_address=oculus_ip or None) if self.world_input is None else None
 
         # Ensure OculusReader has been initialized.
         time.sleep(0.5)
@@ -216,12 +230,15 @@ class RosOperator(Node):
         self.start_pose_matrix = self.zero_matrix
 
         self.control_timer = self.create_timer(1.0 / max(control_rate_hz, 1.0), self.control_loop)
+        if self.world_input is not None:
+            self.create_timer(5.0, self.log_world_input_status)
 
         self.get_logger().info(
             f"pub_delta_pose ready ({self.hand_name}). "
-            f"transport={'Wi-Fi ADB (' + oculus_ip + ':5555)' if oculus_ip else 'USB ADB'}, "
+            f"transport={'Quest LOCAL / USB ADB' if self.world_input is not None else 'Wi-Fi ADB (' + oculus_ip + ':5555)' if oculus_ip else 'USB ADB'}, "
             f"translation_scale={self.translation_scale.tolist()}, "
             f"delta_frame={self.delta_frame}, "
+            f"coordinate_mode={self.coordinate_mode}, "
             f"handle_topic={handle_pose_topic}, feedback_topic={feedback_tcp_pose_topic}, "
             f"delta_topic={delta_pose_topic}, control_topic={control_joint_topic}, "
             f"teleop_status={self.teleop_enabled_topic}, "
@@ -230,6 +247,43 @@ class RosOperator(Node):
             f"auto_home_on_stop={self.auto_home_on_stop}, "
             f"home_service={move_home_service}"
         )
+
+    def world_input_callback(self, msg):
+        try:
+            changed = self.world_input.update(msg.data)
+        except (ValueError, TypeError, KeyError) as error:
+            self.world_input.packet = None
+            self.world_input.received_ns = None
+            self._hold_world_input(str(error))
+            return
+        if changed:
+            self._hold_world_input("Quest 追踪空间已重置；请将手柄水平指向基座 +X 后重新按 A")
+        self._update_world_pose()
+
+    def _update_world_pose(self):
+        pose = self.world_input.mapped_pose()
+        if pose is None:
+            self.x = None
+            return
+        self.x, self.y, self.z = pose[:3, 3].tolist()
+        self.roll, self.pitch, self.yaw = Rotation.from_matrix(pose[:3, :3]).as_euler("xyz").tolist()
+
+    def _hold_world_input(self, reason):
+        if self.flag or self.following:
+            self._set_following(False)
+            self._set_teleop_enabled(False)
+            self.follow_requires_release = True
+        if reason != self.world_input_error:
+            self.get_logger().warning(reason)
+            self.world_input_error = reason
+
+    def log_world_input_status(self):
+        # Camera/tactile readiness is independent of Quest input readiness.
+        # Keep an inactive controller visible after the one-time warning has
+        # scrolled past during image-device startup.
+        reason = self.world_input.unavailable_reason()
+        if reason is not None:
+            self.get_logger().info(f"[状态] Quest 未就绪 | {reason} | 恢复后重新按 A 接入")
 
     def handle_pose_callback(self, msg: PoseStamped):
         self.x = msg.pose.position.x
@@ -331,6 +385,7 @@ class RosOperator(Node):
         if self.delta_frame == "tcp":
             hand_to_base = self.zero_matrix[:3, :3] @ hand_to_base @ self.start_pose_matrix[:3, :3].T
         self.get_logger().info("遥操参考坐标: " + json.dumps({
+            "coordinate_mode": getattr(self, "coordinate_mode", "relative"),
             "delta_frame": self.delta_frame,
             "hand_reference": self.start_pose_matrix.round(6).tolist(),
             "tcp_reference": self.zero_matrix.round(6).tolist(),
@@ -370,6 +425,12 @@ class RosOperator(Node):
             self.tcp_yaw,
         )
         self._log_reference_frames()
+        world = getattr(self, "world_input", None)
+        if world is not None:
+            metadata = {**world.metadata(), "hand_reference": self.start_pose_matrix.tolist(),
+                        "tcp_reference": self.zero_matrix.tolist(), "delta_frame": self.delta_frame,
+                        "reference_host_ts_ns": time.monotonic_ns()}
+            self.pub_coordinate_status.publish(String(data=json.dumps(metadata, allow_nan=False)))
 
     def _home_in_progress(self) -> bool:
         return self.home_future is not None and not self.home_future.done()
@@ -425,7 +486,33 @@ class RosOperator(Node):
             )
 
     def control_loop(self):
-        _, buttons = self.oculus_reader.get_transformations_and_buttons()
+        world = getattr(self, "world_input", None)
+        if world is None:
+            _, buttons = self.oculus_reader.get_transformations_and_buttons()
+        else:
+            buttons = world.packet["buttons"] if world.fresh() and world.packet is not None else {}
+        start_pressed = self.start_edge.update(buttons.get(self.start_button, False))
+        if start_pressed:
+            self.get_logger().info(f"[遥操] {self.start_button} 已收到")
+        if world is not None:
+            if not world.valid():
+                self.world_input_ready = False
+                reason = world.unavailable_reason()
+                self._hold_world_input(reason + "；已禁止跟随，恢复后请松开并重新按 A")
+                if start_pressed:
+                    self.get_logger().warning(f"[遥操] A 未接入：{reason}")
+                # B still works on fresh button data, but no cached gripper
+                # command or A/RG engagement may pass a lost-pose boundary.
+                if self.stop_edge.update(buttons.get(self.stop_button, False)):
+                    action = "停止遥操作并回零" if self.auto_home_on_stop else "停止遥操作，不自动回零"
+                    self.get_logger().info(f"[遥操] B：{action}")
+                    self._schedule_home()
+                return
+            if not getattr(self, "world_input_ready", False) or self.world_input_error is not None:
+                self.get_logger().info("[设备] Quest 世界输入就绪：完整空间追踪有效；松开后重新按 A 对齐，再按住 RG 跟随")
+            self.world_input_ready = True
+            self.world_input_error = None
+            self._update_world_pose()
 
         # Gripper control
         trigger_value = self._extract_trigger_value(buttons)
@@ -440,14 +527,25 @@ class RosOperator(Node):
         self.pub_move_j.publish(gripper_msg)
 
         # B must work even if hand tracking is unavailable or A was never pressed.
-        start_pressed = self.start_edge.update(buttons.get(self.start_button, False))
         if self.stop_edge.update(buttons.get(self.stop_button, False)):
             action = "停止遥操作并回零" if self.auto_home_on_stop else "停止遥操作，不自动回零"
-            self.get_logger().info(f"[{self.hand_name}] B：{action}")
+            self.get_logger().info(f"[遥操] B：{action}")
             self._set_following(False)
             self._set_teleop_enabled(False)
             self._schedule_home()
             return
+
+        if world is not None and start_pressed and world.rotation is None:
+            if self._home_in_progress() or self.tcp_x is None:
+                self.get_logger().warning("机械臂 TCP 未就绪或正在回零，忽略世界方向标定，请就绪后重新按 A")
+                return
+            try:
+                world.align_once()
+            except ValueError as error:
+                self.get_logger().warning(str(error))
+                return
+            self._update_world_pose()
+            self.get_logger().info("[设备] 世界方向已锁定：首次 A 的水平指向 → 基座 +X；此后 A/RG/RJ 只重设起点")
 
         if self.x is None:
             return
@@ -473,7 +571,7 @@ class RosOperator(Node):
                     self._set_following(False)
                     self.follow_requires_release = bool(buttons.get(self.follow_button, False))
                     self.get_logger().info(
-                        f"[{self.hand_name}] A：已对齐当前 TCP；松开后重新按住 {self.follow_button} 才跟随"
+                        f"[遥操] A：已对齐当前 TCP；松开后重新按住 {self.follow_button} 才跟随"
                     )
                     self._set_teleop_enabled(True)
 
@@ -521,7 +619,8 @@ class RosOperator(Node):
         if self.context.ok():
             self._set_following(False)
             self._set_teleop_enabled(False)
-        self.oculus_reader.stop()
+        if self.oculus_reader is not None:
+            self.oculus_reader.stop()
         return super().destroy_node()
 
 

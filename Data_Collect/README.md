@@ -38,6 +38,7 @@ ROS 包中同时保留旧标准 Piper 与 Piper-X 模型。当前实机采集配
 ```bash
 ./start.sh                              # 自动加载环境、打开工作台并启动遥操
 ./start.sh --can-port can1                # 选择 CAN 接口
+./start.sh --coordinate-mode world        # Quest LOCAL 世界坐标（先安装独立 APK）
 ./start.sh --demo --no-browser --port 8767 # 离线演示，不需要 capture/ROS 环境
 ./start.sh --terminal can_port:=can0      # 无工作台的终端模式
 ./start.sh --terminal can_port:=can0 teleop_only:=true # 仅遥操，不启动相机、触觉或录制
@@ -48,6 +49,8 @@ python3 -m data_collect.cli.cameras        # 只读识别相机，不连接机�
 source env.sh export
 python3 -m data_collect.cli.export --help
 ```
+
+新增两种可选坐标模式：`relative` 保留原有算法，`world` 使用 Quest LOCAL 位姿和启动时锁定的基座方向。工作台左侧可选择，停止程序后切换；完整准备与命令见 [世界坐标使用说明](docs/quest_world_usage.md)。
 
 `start.sh` 自动加载 `env.sh`、内部 ROS overlay 并启动 ADB，无需每次手动 source。首次环境安装、ROS 构建、设备授权及 CAN 接口配置仍按下文准备。重复运行会复用相同工作台及其进程。工作台和终端模式不要同时启动。安装本包后也可使用 `piper-collect-gui`、`piper-collect-review`、`piper-collect-export`、`piper-collect-calibrate-latency` 命令。
 

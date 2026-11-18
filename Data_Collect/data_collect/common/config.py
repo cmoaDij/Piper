@@ -74,6 +74,9 @@ def load_config(path=None):
         raise ValueError("当前实机反馈已核对为 Piper-X，请勿使用标准 Piper 模型")
     if len(cfg["tcp_offset"]) != 6 or not all(math.isfinite(v) for v in cfg["tcp_offset"]):
         raise ValueError("tcp_offset 必须为有限的六维 xyz/rpy")
+    teleop = cfg.setdefault("teleop", {})
+    if teleop.setdefault("coordinate_mode", "relative") not in ("relative", "world"):
+        raise ValueError("teleop.coordinate_mode 必须为 relative/world")
     return cfg
 
 

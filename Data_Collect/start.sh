@@ -21,8 +21,9 @@ for piper_argument in "$@"; do
     case "$piper_argument" in
         --demo) piper_demo=true ;;
         --help|-h)
-            echo "用法：./start.sh [--can-port can0] [--port 8766] [--no-browser] [--demo]"
+            echo "用法：./start.sh [--can-port can0] [--coordinate-mode relative|world] [--port 8766] [--no-browser] [--demo]"
             echo "终端模式：./start.sh --terminal [can_port:=can0] [其他 ROS launch 参数]"
+            echo "坐标选择：coordinate_mode:=relative（原方案）或 coordinate_mode:=world（Quest LOCAL）"
             echo "默认自动加载环境并启动工作台与遥操节点；按 A 从当前姿态对齐，不回零。"
             exit 0
             ;;

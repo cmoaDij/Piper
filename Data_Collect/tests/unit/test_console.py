@@ -48,3 +48,11 @@ def test_unstructured_native_stderr_is_visible():
     console = CollectionConsole(output.append)
     console.feed(4, 2, b"USB device unavailable\n")
     assert output == ["USB device unavailable"]
+
+
+def test_a_acknowledgement_and_tracking_recovery_are_visible_in_concise_mode():
+    output = []
+    console = CollectionConsole(output.append)
+    for text in ("[遥操] A 已收到", "[设备] Quest 世界输入就绪", "[遥操] A：已对齐当前 TCP"):
+        console.feed(1, 1, f"[INFO] [123.4] [node]: {text}\n".encode())
+    assert output == ["[遥操] A 已收到", "[设备] Quest 世界输入就绪", "[遥操] A：已对齐当前 TCP"]

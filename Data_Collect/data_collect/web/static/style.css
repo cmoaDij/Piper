@@ -1,10 +1,10 @@
 :root{color-scheme:dark;--bg:#0c121b;--panel:#121d2a;--border:#233244;--text:#e5edf7;--muted:#8296ae;--teal:#40d5bd;--orange:#f3b764;--red:#ff7f86;--joint1:#47d6bb;--joint2:#73acff;--joint3:#c49bff;--joint4:#f5bd6e;--joint5:#fa839d;--joint6:#70d4f5}
 *{box-sizing:border-box}
 body{margin:0;font:13px/1.5 system-ui,"Noto Sans CJK SC",sans-serif;background:var(--bg);color:var(--text);display:flex}
-button,input{font:inherit}
+button,input,select{font:inherit}
 button{cursor:pointer;border:1px solid transparent;border-radius:6px;transition:background .15s,opacity .15s}
 button:disabled{cursor:not-allowed;opacity:.38}
-button:focus-visible,input:focus-visible{outline:2px solid var(--teal);outline-offset:3px}
+button:focus-visible,input:focus-visible,select:focus-visible{outline:2px solid var(--teal);outline-offset:3px}
 button:not(:disabled):hover{filter:brightness(1.15)}
 input[type=checkbox]{accent-color:var(--teal);vertical-align:middle;margin-right:5px}
 a{color:inherit}
@@ -187,3 +187,5 @@ h1{font-size:18px}
 .view-legend input{width:11px;height:11px}
 }
 
+
+.field select{max-width:142px;background:#0b1420;color:var(--text);padding:5px 4px;border:1px solid var(--border);border-radius:5px;font-size:11px}

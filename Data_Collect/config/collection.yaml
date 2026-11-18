@@ -23,6 +23,7 @@ tip_link: link6
 tcp_offset: [0.0, 0.0, 0.195, 0.0, 0.0, 0.0]
 # Driver motion settings follow QuestArmTeleop's Piper-X launch; see delta_frame below.
 teleop:
+  coordinate_mode: relative  # relative 原有头显相对/TCP；world 使用独立 Quest LOCAL 输入
   # Controller-frame correction from QuestArmTeleop's Piper-X launch, in radians.
   ros_to_arm_rpy: [-1.5708, 0.0, -1.5708]
   # Map controller-local changes into the captured TCP frame, as QuestArmTeleop does.

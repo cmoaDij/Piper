@@ -14,6 +14,8 @@
  <div class="workspace"><span class="eyebrow">当前工作空间</span><strong>Piper-X <span class="muted">/ 六轴机械臂</span></strong><div class="tag">Data_Collect</div></div>
  <div class="section-label">运行控制</div>
  <label class="field">CAN 接口 <input id="can-port" value="can0" pattern="(?:v?can)[0-9]{1,3}" maxlength="7" spellcheck="false"></label>
+ <label class="field">坐标模式 <select id="coordinate-mode"><option value="relative">原有相对坐标</option><option value="world">世界坐标 LOCAL</option></select></label>
+ <p id="coordinate-hint" class="control-note"></p>
  <button id="start" class="primary"><span class="play-icon">▶</span> 启动遥操程序</button>
  <button id="hold" class="warning" disabled>Ⅱ 停止遥操</button>
  <button id="stop" class="secondary" disabled>■ 停止程序并保存</button>

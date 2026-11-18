@@ -65,3 +65,37 @@ def test_gopro_profile_restores_automatic_home_at_existing_slow_speed():
     assert cfg["teleop"]["auto_home_on_stop"] is True
     assert cfg["teleop"]["home_speed_percent"] == 5
     assert cfg["teleop"]["auto_home_delay_s"] == .5
+
+
+@pytest.mark.parametrize("teleop_only", [False, True])
+def test_world_mode_selects_native_input_and_base_mapping_and_records_mode(monkeypatch, teleop_only):
+    pytest.importorskip("launch_ros")
+    from launch import LaunchContext
+    from launch.actions import DeclareLaunchArgument, ExecuteProcess
+    from launch.utilities import perform_substitutions
+
+    spec = importlib.util.spec_from_file_location("world_collect_launch", ROOT / "launch/collect.launch.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    monkeypatch.setattr(module, "get_package_share_directory", lambda name: str(ROOT / "ros_ws/src" / name))
+    monkeypatch.setattr(module, "Node", lambda **kwargs: SimpleNamespace(**kwargs))
+    context = LaunchContext()
+    for action in module.generate_launch_description().entities:
+        if isinstance(action, DeclareLaunchArgument):
+            context.launch_configurations[action.name] = perform_substitutions(context, action.default_value)
+    context.launch_configurations.update(coordinate_mode="world", quest_input="false",
+                                         teleop_only=str(teleop_only).lower())
+    actions = module._launch(context)
+    nodes = [action for action in actions if isinstance(action, SimpleNamespace)]
+    assert any(node.executable == "pub_quest_world.py" for node in nodes)
+    delta = next(node for node in nodes if node.executable == "pub_delta_pose.py")
+    assert delta.parameters[0]["coordinate_mode"] == "world"
+    assert delta.parameters[0]["delta_frame"] == "base"
+    collector = next(action for action in actions if isinstance(action, ExecuteProcess))
+    command = [perform_substitutions(context, item) for item in collector.cmd]
+    assert command[command.index("--coordinate-mode") + 1] == "world"
+    assert command[command.index("--delta-frame") + 1] == "base"
+    assert ("--teleop-only" in command) is teleop_only
+    context.launch_configurations["delta_frame"] = "tcp"
+    with pytest.raises(ValueError, match="tcp"):
+        module._launch(context)

@@ -1,5 +1,9 @@
 .venv/
 .runtime/
+vendor/quest_world/app/.gradle/
+vendor/quest_world/app/.cxx/
+vendor/quest_world/app/build/
+vendor/quest_world/app/local.properties
 __pycache__/
 logs/
 *.egg-info/

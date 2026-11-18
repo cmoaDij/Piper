@@ -48,7 +48,7 @@ class CollectionConsole:
             self.emit(line)
         elif level in ("WARN", "WARNING", "ERROR", "FATAL", "CRITICAL"):
             self.emit(f"[{'警告' if level in ('WARN', 'WARNING') else '错误'}] {message}")
-        elif any(tag in message for tag in ("[采集]", "[状态]", "[设备]", "[回零]")):
+        elif any(tag in message for tag in ("[采集]", "[状态]", "[设备]", "[回零]", "[遥操]")):
             self.emit(message)
         elif "Moving home at " in message:
             self.emit("[回零] 开始，" + message.split("Moving home at ", 1)[1].replace(" speed", " 速度"))

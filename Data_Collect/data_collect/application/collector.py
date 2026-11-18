@@ -141,6 +141,19 @@ def build_driver_class(base, cfg, manager, observer, *, teleop_only=False, robot
             self.create_subscription(JointState, "/teleop/joint_states", self.on_target, 20)
             self.create_subscription(Bool, "/teleop/enabled", self.on_enabled, 10)
             self.create_subscription(Bool, "/teleop/following", self.on_following, 10)
+            self.create_subscription(String, "/teleop/coordinate_status", self.on_coordinate_status, 10)
+
+        def on_coordinate_status(self, msg):
+            try:
+                status = json.loads(msg.data)
+                if not isinstance(status, dict):
+                    raise ValueError("坐标状态应为对象")
+                if status.get("coordinate_mode") != cfg["teleop"]["coordinate_mode"]:
+                    raise ValueError("输入坐标模式与采集配置不一致")
+                with manager.lock:
+                    cfg["teleop"]["reference"] = status
+            except (ValueError, TypeError) as error:
+                self.get_logger().error(f"坐标状态无效: {error}")
 
         def __init__(self):
             self.targets = TeleopTarget()
@@ -218,7 +231,8 @@ def build_driver_class(base, cfg, manager, observer, *, teleop_only=False, robot
             self.hold_arm_target()
             if self.following:
                 self.publish_ik_reference()
-            self.get_logger().info("[采集] A 已对齐，等待 RG；尚未录制")
+            self.get_logger().info("[遥操] A 已对齐，等待 RG；仅遥操，不录制" if teleop_only
+                                   else "[采集] A 已对齐，等待 RG；尚未录制")
             self.publish_status()
 
         def hold_arm_target(self):
@@ -382,7 +396,7 @@ def build_driver_class(base, cfg, manager, observer, *, teleop_only=False, robot
                     phase = "暂停" if writer.timeline and not writer.timeline.active else "录制"
                     state = f"{phase} {writer.path.name} | 有效 {duration:.1f} 秒"
                 else:
-                    state = "未录制"
+                    state = "仅遥操（不录制）" if teleop_only else "未录制"
                 try:
                     if teleop_only:
                         from data_collect.common.diagnostics import require_feedback_fresh
@@ -396,7 +410,7 @@ def build_driver_class(base, cfg, manager, observer, *, teleop_only=False, robot
                 labels = {"cameras/wrist_rgb": "手腕", "cameras/global_rgb": "全局",
                           "tactile/left_raw": "左触觉", "tactile/right_raw": "右触觉"}
                 rates = []
-                for stream, stamps in manager.stream_times.items():
+                for stream, stamps in (() if teleop_only else manager.stream_times.items()):
                     limit = cfg["audit"]["rgb_red_ms" if stream.startswith("cameras/") else "tactile_red_ms"]
                     fresh = bool(stamps) and 0 <= now - stamps[-1] <= limit * 1e6
                     fps = (len(stamps) - 1) * 1e9 / (stamps[-1] - stamps[0]) if len(stamps) > 1 and stamps[-1] > stamps[0] else 0
@@ -445,6 +459,7 @@ def build_driver_class(base, cfg, manager, observer, *, teleop_only=False, robot
                 message.data = json.dumps(
                     {
                         "recording": str(manager.current.path) if manager.current else None,
+                        "coordinate_mode": cfg["teleop"]["coordinate_mode"],
                         "recording_paused": bool(writer and writer.timeline and not writer.timeline.active),
                         "armed": self.pending_episode,
                         "aligned": self.aligned,
@@ -480,11 +495,19 @@ def build_driver_class(base, cfg, manager, observer, *, teleop_only=False, robot
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", default="config/collection.yaml")
+    parser.add_argument("--coordinate-mode", choices=("relative", "world"))
+    parser.add_argument("--delta-frame", choices=("tcp", "base"))
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--teleop-only", action="store_true", help="只运行遥操和机器人反馈，不启动相机、触觉或录制")
     mode.add_argument("--robot-latency-only", action="store_true", help="仅录制机器人指令/反馈，不启动相机或触觉，不生成训练数据")
     args, ros_args = parser.parse_known_args()
     cfg = load_config(args.config)
+    if args.coordinate_mode:
+        cfg["teleop"]["coordinate_mode"] = args.coordinate_mode
+    if args.delta_frame:
+        cfg["teleop"]["delta_frame"] = args.delta_frame
+    if cfg["teleop"]["coordinate_mode"] == "world":
+        cfg["teleop"]["delta_frame"] = "base"
     os.chdir(ROOT)
     calibration_error = None
     if args.robot_latency_only:

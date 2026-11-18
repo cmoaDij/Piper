@@ -75,6 +75,24 @@ def _launch(context):
         override = LaunchConfiguration(name).perform(context)
         return override or str(cfg["teleop"][name]).lower()
 
+    coordinate_mode = teleop_option("coordinate_mode")
+    if coordinate_mode not in ("relative", "world"):
+        raise ValueError("coordinate_mode 必须为 relative/world")
+    delta_frame = teleop_option("delta_frame")
+    if coordinate_mode == "world":
+        if LaunchConfiguration("delta_frame").perform(context) == "tcp":
+            raise ValueError("世界坐标模式不能与 delta_frame:=tcp 同时使用")
+        delta_frame = "base"
+        # Fail before starting the CAN driver if world input cannot start.
+        if LaunchConfiguration("quest_input").perform(context) == "true":
+            from data_collect.sensors.quest_world import adb_serial, PACKAGE
+            import subprocess
+            serial = adb_serial()
+            installed = subprocess.run(["adb", "-s", serial, "shell", "pm", "path", PACKAGE],
+                                       check=True, capture_output=True, text=True, timeout=10)
+            if not installed.stdout.strip().startswith("package:"):
+                raise RuntimeError("请先执行 python -m data_collect.cli.quest_world --install 安装世界坐标 APK")
+
     controller_rpy = [
         float(LaunchConfiguration("ros_to_arm_" + axis).perform(context) or default)
         for axis, default in zip(("roll", "pitch", "yaw"), cfg["teleop"]["ros_to_arm_rpy"])
@@ -96,13 +114,16 @@ def _launch(context):
     }
     for name, value in values.items():
         params.extend(["-p", f"{name}:={value}"])
-    collector_options = ["--config", cfg_path]
-    if LaunchConfiguration("teleop_only").perform(context) == "true":
+    collector_options = ["--config", cfg_path, "--coordinate-mode", coordinate_mode, "--delta-frame", delta_frame]
+    teleop_only = LaunchConfiguration("teleop_only").perform(context) == "true"
+    if teleop_only:
         collector_options.append("--teleop-only")
     return [
         *console_actions,
         LogInfo(msg=(f"[启动] {cfg['arm_type']} | CAN {LaunchConfiguration('can_port').perform(context)}"
                      f" | 控制 {cfg['control_hz']} Hz | 配置 {local_path(cfg_path).name}"
+                     f" | 模式 {'仅遥操（不录制）' if teleop_only else '采集（A 对齐，RG 录制）'}"
+                     f" | 坐标 {'世界 LOCAL / 固定基座方向' if coordinate_mode == 'world' else '原有相对 / ' + delta_frame}"
                      f" | 完整终端日志: {launch_config.log_dir}/launch.log")),
         SetEnvironmentVariable("PYTHONPATH", str(ROOT) + os.pathsep + os.environ.get("PYTHONPATH", "")),
         # SDK print() output should appear during startup, not flush in a
@@ -133,7 +154,7 @@ def _launch(context):
         ),
         Node(
             package="oculus_reader",
-            executable="pub_pose.py",
+            executable="pub_quest_world.py" if coordinate_mode == "world" else "pub_pose.py",
             output=output,
             condition=IfCondition(LaunchConfiguration("quest_input")),
             parameters=[{"oculus_ip": "", "ros_to_arm_rpy": controller_rpy}],
@@ -147,7 +168,8 @@ def _launch(context):
                 {
                     "oculus_ip": "",
                     "translation_scale": [1.0, 1.0, 1.0],
-                    "delta_frame": teleop_option("delta_frame"),
+                    "coordinate_mode": coordinate_mode,
+                    "delta_frame": delta_frame,
                     "gripper_max_range": cfg["gripper_max_m"],
                     "control_joint_topic": "/teleop/joint_states",
                     "reset_button": "RJ",
@@ -173,6 +195,10 @@ def generate_launch_description():
             ),
             DeclareLaunchArgument("auto_enable", default_value="true", choices=["true", "false"]),
             DeclareLaunchArgument("quest_input", default_value="true", choices=["true", "false"]),
+            DeclareLaunchArgument(
+                "coordinate_mode", default_value="", choices=["", "relative", "world"],
+                description="relative 保留原有相对坐标；world 使用 Quest LOCAL 世界坐标并锁定基座方向",
+            ),
             DeclareLaunchArgument("fast_mode", default_value="", choices=["", "false", "true"]),
             DeclareLaunchArgument(
                 "auto_home_on_stop", default_value="", choices=["", "true", "false"]
