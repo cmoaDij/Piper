@@ -11,9 +11,10 @@ from pathlib import Path
 import h5py
 import numpy as np
 
-from data_collect.common.config import IMAGE_STREAMS
+from data_collect.common.config import image_streams
 from data_collect.common.diagnostics import require_feedback_fresh
 from data_collect.recording.images import RGBVideoWriter, select_encoder
+from data_collect.recording.timeline import RecordingTimeline
 
 
 class EpisodeWriter:
@@ -35,14 +36,20 @@ class EpisodeWriter:
         self.rejection = None
         self.dropped = 0
         self.end_ns = None
+        self.timeline = (RecordingTimeline(metadata["start_host_ts_ns"])
+                         if metadata.get("recording_mode") == "grip_paused" else None)
         self.thread = threading.Thread(target=self._run, name=self.path.stem + "-writer")
         self.thread.start()
 
-    def submit(self, group, record):
-        size = sum(np.asarray(v).nbytes for v in record.values())
+    def submit(self, group, record, *, seed=False):
         with self.lock:
             if self.done.is_set() or self.error:
                 return False
+            if self.timeline is not None:
+                record = self.timeline.prepare(group, record, seed=seed)
+                if record is None:
+                    return True
+            size = sum(np.asarray(v).nbytes for v in record.values())
             if self.pending_bytes + size > self.max_bytes or self.queue.full():
                 self.dropped += 1
                 self.error = (
@@ -56,9 +63,19 @@ class EpisodeWriter:
             self.queue.put_nowait((group, record, size))
         return True
 
+    def set_recording(self, active, stamp_ns):
+        with self.lock:
+            if self.done.is_set() or self.error:
+                return False
+            if self.timeline is not None:
+                self.timeline.set_recording(active, stamp_ns)
+            return True
+
     def finish(self, end_ns, error=None, *, rejected=False):
         with self.lock:
             self.end_ns = int(end_ns)
+            if self.timeline is not None:
+                self.timeline.set_recording(False, end_ns)
             if error:
                 if rejected:
                     self.rejection = error
@@ -127,8 +144,16 @@ class EpisodeWriter:
                     )
                 f.attrs["schema_version"] = "piper_raw_v2"
                 f.attrs["complete"] = False
-                for stream in IMAGE_STREAMS:
-                    f.require_group(stream).attrs["color_order"] = "RGB"
+                f.attrs["image_streams"] = json.dumps(image_streams(config))
+                for stream in image_streams(config):
+                    group = f.require_group(stream)
+                    group.attrs["color_order"] = "RGB"
+                    if stream.startswith("cameras/"):
+                        options = config["cameras"][stream.split("/")[-1]]
+                        group.attrs["backend"] = options.get("backend", "realsense")
+                        for key in ("serial", "receive_latency_ns", "receive_latency_sha256"):
+                            if key in options:
+                                group.attrs[key] = options[key]
                 for name in ("robot_feedback", "robot_command"):
                     f.require_group(name)
                 for stream, baseline in self.baselines.items():
@@ -158,7 +183,9 @@ class EpisodeWriter:
                                         video_quality=self.settings.get("video_quality", 18),
                                         video_pixel_format="yuv420p", video_fps=fps,
                                         video_time_base_num=1, video_time_base_den=fps,
-                                        timestamp_source="available_host_ts_ns; video PTS is frame_index/fps",
+                                        timestamp_source=("capture_host_ts_ns = available_host_ts_ns - receive_latency_ns"
+                                                          if f[group].attrs["backend"] == "gopro" else "available_host_ts_ns")
+                                                         + "; video PTS is frame_index/fps, not observation time",
                                     )
                                 index = videos[group].append(image)
                                 record["video_frame_index"] = np.int64(index)
@@ -175,6 +202,8 @@ class EpisodeWriter:
                 for group, video in videos.items():
                     f[group].attrs["video_sha256"] = video.finish()
                 f.attrs["end_host_ts_ns"] = self.end_ns or time.monotonic_ns()
+                if self.timeline is not None:
+                    f.attrs["recording_intervals_host_ts_ns"] = json.dumps(self.timeline.intervals)
                 f.attrs["dropped_samples"] = self.dropped
                 f.attrs["collection_error"] = self.error or self.rejection or ""
                 f.attrs["failure_kind"] = "capture_fault" if self.error else "episode_rejected" if self.rejection else ""
@@ -200,7 +229,7 @@ class EpisodeManager:
         self.current = None
         self.finished = []
         self.latest = {}
-        self.stream_times = {name: deque(maxlen=256) for name in IMAGE_STREAMS}
+        self.stream_times = {name: deque(maxlen=256) for name in image_streams(config)}
         self.feedback_preroll = deque()
         self.baselines = {}
         self.failure = None
@@ -249,7 +278,7 @@ class EpisodeManager:
         with self.lock:
             if self.failure:
                 raise RuntimeError(self.failure)
-            required = set(IMAGE_STREAMS) | {"robot_feedback"}
+            required = set(image_streams(self.cfg)) | {"robot_feedback"}
             if not required.issubset(self.latest):
                 raise RuntimeError(f"传感器尚未就绪: {sorted(required - self.latest.keys())}")
             start = time.monotonic_ns()
@@ -265,13 +294,19 @@ class EpisodeManager:
                     ]
                 if not 0 <= start - oldest <= limit * 1e6:
                     raise RuntimeError(f"{stream} 数据已过期: age={(start - oldest) / 1e6:.1f} ms，要求 0–{limit:g} ms")
-            missing = {s for s in IMAGE_STREAMS if s.startswith("tactile/")} - self.baselines.keys()
+            missing = {s for s in image_streams(self.cfg) if s.startswith("tactile/")} - self.baselines.keys()
             if missing:
                 raise RuntimeError(f"触觉无接触基线尚未就绪: {sorted(missing)}")
 
     def start(self):
         with self.lock:
             if self.current:
+                if self.current.timeline is None or self.current.timeline.active:
+                    return self.current.path
+                self.require_ready()
+                if not self.current.set_recording(True, time.monotonic_ns()):
+                    raise RuntimeError(self.current.error or "恢复写入失败")
+                self._seed_current()
                 return self.current.path
             self.require_ready()
             if sum(w.thread.is_alive() for w in self.finished) >= 2:
@@ -286,6 +321,7 @@ class EpisodeManager:
                 config=self.cfg,
                 calibration=self.cfg.get("calibration", {}),
                 simulated=False,
+                recording_mode="grip_paused",
             )
             # Exclusive reservation prevents collisions across processes/restarts.
             for number in range(1, 1_000_000):
@@ -314,16 +350,23 @@ class EpisodeManager:
             if writer.error:
                 self.fail(writer.error)
                 raise RuntimeError(writer.error)
-            for group, record in self.latest.items():
-                if group != "robot_feedback":
-                    if not writer.submit(group, record):
-                        self.fail(writer.error or "writer_not_accepting_samples")
-                        raise RuntimeError(self.failure)
-            for record in self.feedback_preroll:
-                if not writer.submit("robot_feedback", record):
-                    self.fail(writer.error or "writer_not_accepting_samples")
-                    raise RuntimeError(self.failure)
+            self._seed_current()
             return writer.path
+
+    def _seed_current(self):
+        # One current causal observation per stream, without backfilling pauses
+        # or seeding an old command issued while RG was released.
+        for group, record in self.latest.items():
+            if group == "robot_command":
+                continue
+            if not self.current.submit(group, record, seed=True):
+                self.fail(self.current.error or "writer_not_accepting_samples")
+                raise RuntimeError(self.failure)
+
+    def pause(self):
+        with self.lock:
+            if self.current and not self.current.set_recording(False, time.monotonic_ns()):
+                self.fail(self.current.error or "暂停写入失败")
 
     def stop(self):
         with self.lock:

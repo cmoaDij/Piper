@@ -74,12 +74,3 @@ def pose_error(model_pose, sdk_pose):
     rotation = float((Rotation.from_euler("xyz", model_pose[3:]).inv() * Rotation.from_euler("xyz", sdk_pose[3:])).magnitude())
     return position, rotation
 
-
-def check_kinematics(feedback, rules):
-    skew = abs(float(feedback["sdk_joint_ts"]) - float(feedback["sdk_tcp_ts"]))
-    if skew > rules["feedback_skew_s"]:
-        raise ValueError(f"关节/TCP 反馈不同步：{skew * 1000:.1f} ms")
-    position, rotation = pose_error(feedback["model_tcp_pose"], feedback["tcp_pose"])
-    if position > rules["fk_position_tolerance_m"] or rotation > rules["fk_rotation_tolerance_rad"]:
-        raise ValueError(f"模型 FK 与 SDK TCP 不一致：{position * 1000:.1f} mm / {np.rad2deg(rotation):.2f}°，拒绝运动")
-    return position, rotation

@@ -1,7 +1,7 @@
 import {createRobotView} from './robot.js';
 const $=id=>document.getElementById(id), deg=x=>x*180/Math.PI;
 const colors=['#47d6bb','#73acff','#c49bff','#f5bd6e','#fa839d','#70d4f5'];
-const labels={'cameras/global_rgb':['全局相机','D455'],'cameras/wrist_rgb':['手腕相机','D435i'],'tactile/left_raw':['左触觉','Tac-X'],'tactile/right_raw':['右触觉','Tac-X']};
+const labels={'cameras/global_rgb':['全局相机','RealSense'],'cameras/wrist_rgb':['手腕相机','RealSense / GoPro'],'tactile/left_raw':['左触觉','Tac-X'],'tactile/right_raw':['右触觉','Tac-X']};
 let boot,viewer=null,state=null,logCursor=0,logs=[],samples=[],previous=null,chartMode='position',pendingAction=false,lastRobotStamp=0,localMessage='',lastPoll=0;
 const number=(value,digits=1)=>typeof value==='number'&&Number.isFinite(value)?value.toFixed(digits):'—';
 function text(id,value){$(id).textContent=value}
@@ -9,7 +9,10 @@ function fault(value){return Array.isArray(value)?value.filter(Boolean).join('�
 function toast(message){text('toast',message);$('toast').hidden=false;clearTimeout(toast.timer);toast.timer=setTimeout(()=>$('toast').hidden=true,6000)}
 function phase(label,kind=''){text('phase',label);$('phase').className='phase '+kind;$('run-indicator').className='run-indicator '+kind}
 function fit(canvas){const r=canvas.getBoundingClientRect(),scale=Math.min(devicePixelRatio,2);if(canvas.width!==Math.round(r.width*scale)||canvas.height!==Math.round(r.height*scale)){canvas.width=Math.round(r.width*scale);canvas.height=Math.round(r.height*scale)}const ctx=canvas.getContext('2d');ctx.setTransform(scale,0,0,scale,0,0);return {ctx,w:r.width,h:r.height}}
+function coordinateHint(){text('coordinate-hint',$('coordinate-mode').value==='world'?'首次 A：手柄水平指向基座 +X，锁定方向。此后 A/RG/RJ 只重设起点；更换模式须先停止程序。':'沿用头显相对位姿与 TCP 局部增量。更换模式须先停止程序。')}
 function prepareUI(){
+ $('coordinate-mode').value=boot.teleop.coordinate_mode||'relative';$('coordinate-mode').onchange=coordinateHint;coordinateHint();
+ $('can-port').value=boot.can_port||'can0';
  for(const [stream,[name,type]] of Object.entries(labels)){
   const row=document.createElement('div');row.className='sensor';row.dataset.stream=stream;
   row.innerHTML='<i class="dot"></i><div><strong></strong><small></small></div><span class="rate">— Hz</span>';
@@ -25,15 +28,15 @@ function prepareUI(){
   const label=document.createElement('span');label.innerHTML=`<i style="background:${colors[i]}"></i>J${i+1}`;$('joint-legend').append(label);
  });
  for(const name of ['X','Y','Z','Roll','Pitch','Yaw']){const cell=document.createElement('div');cell.className='tcp-value';cell.innerHTML='<small></small><strong>—</strong>';cell.firstChild.textContent=name;$('tcp-values').append(cell)}
- text('speed-limit',number(deg(boot.safety.max_velocity_rad_s),0)+'°/s');text('step-limit',number(deg(boot.safety.max_command_step_rad),1)+'°');text('acceleration-limit','加速度 ≤ '+number(deg(boot.safety.max_acceleration_rad_s2),0)+'°/s² · 目标距离 ≤ '+number(deg(boot.safety.max_target_lead_rad),0)+'°');
- if(boot.demo){$('demo-banner').hidden=false;text('mode-badge','离线演示 / 不连接硬件');text('start','▶ 开始离线演示');text('stop','■ 停止演示');text('hold','Ⅱ 暂停演示运动');text('control-note','演示回零、遥操和录制状态。停止运动可暂停演示；模拟轨迹不会写入数据目录。')}
+ text('speed-limit',boot.teleop.fast_mode?'move_js':'move_j');text('step-limit',boot.teleop.speed_percent+'%');text('acceleration-limit','回零速度参数 '+boot.teleop.home_speed_percent+'% · A 从当前姿态对齐');
+ if(boot.demo){$('demo-banner').hidden=false;text('mode-badge','离线演示 / 不连接硬件');text('start','▶ 开始离线演示');text('stop','■ 停止演示');text('hold','Ⅱ 暂停演示运动');text('control-note','演示当前姿态对齐、遥操和录制状态。停止运动可暂停演示；模拟轨迹不会写入数据目录。')}
 }
 async function action(name){
  if(pendingAction)return;pendingAction=true;updateButtons();
- try{const response=await fetch('/api/'+name,{method:'POST',headers:{'Content-Type':'application/json','X-Control-Token':document.querySelector('meta[name=control-token]').content},body:JSON.stringify({can_port:$('can-port').value})});const result=await response.json();if(!response.ok)throw Error(result.error||'操作失败');toast(name==='start'?(boot.demo?'演示已启动':'程序正在启动，准备就绪后请按手柄 A 回零对齐'):name==='hold'?'已请求停止运动 / 取消回零':'正在停止进程并等待数据封盘');localMessage='';if(name==='start'){samples=[];previous=null;lastRobotStamp=0;viewer?.clearPath()}}
+ try{const response=await fetch('/api/'+name,{method:'POST',headers:{'Content-Type':'application/json','X-Control-Token':document.querySelector('meta[name=control-token]').content},body:JSON.stringify({can_port:$('can-port').value,coordinate_mode:$('coordinate-mode').value})});const result=await response.json();if(!response.ok)throw Error(result.error||'操作失败');toast(name==='start'?(boot.demo?'演示已启动':'程序正在启动，准备就绪后请按手柄 A 从当前姿态对齐'):name==='hold'?'已请求停止遥操':'正在停止进程并等待数据封盘');localMessage='';if(name==='start'){samples=[];previous=null;lastRobotStamp=0;viewer?.clearPath()}}
  catch(error){localMessage=error.message;toast(error.message)}finally{pendingAction=false;updateButtons()}
 }
-function updateButtons(){const p=state?.process,age=state?.collector_age_ms,online=age!=null&&age<600,external=state?.nodes?.includes('agx_arm_ctrl_single_node');$('start').disabled=pendingAction||!!p?.running||!!p?.stopping||online||external;$('stop').disabled=pendingAction||!p?.running||!!p?.stopping;$('hold').disabled=pendingAction||!(online||p?.running||external);$('can-port').disabled=pendingAction||!!p?.running||online}
+function updateButtons(){const p=state?.process,age=state?.collector_age_ms,online=age!=null&&age<600,external=state?.nodes?.includes('agx_arm_ctrl_single_node');$('start').disabled=pendingAction||!!p?.running||!!p?.stopping||online||external;$('stop').disabled=pendingAction||!p?.running||!!p?.stopping;$('hold').disabled=pendingAction||!(online||p?.running||external);$('can-port').disabled=pendingAction||!!p?.running||online||external;$('coordinate-mode').disabled=$('can-port').disabled;const mode=online?state.collector?.coordinate_mode:p?.running?p.coordinate_mode:null;if(mode){$('coordinate-mode').value=mode;coordinateHint()}}
 function visibleLogs(){return logs.filter(row=>!$('log-errors').checked||/error|failed|exception|warning|warn|故障|失败|异常|拒绝|超时|停止|取消/i.test(row.text))}
 async function copyLogs(){
  const rows=visibleLogs();if(!rows.length){toast('当前没有可复制的日志');return}
@@ -65,21 +68,20 @@ function update(s){
  if(p.stopping){phase('正在停止','warn');title='正在停止程序';subtitle='等待线程退出和数据写盘完成'}
  else if(err){phase('故障 / 已停止','bad');title='需要检查';subtitle='停止运动后，请查看故障原因与日志'}
  else if(s.demo&&s.demo_paused&&p.running){phase('演示已暂停','warn');title='离线演示已暂停';subtitle='停止演示后可以重新开始'}
- else if(online&&c.preparing_home){phase('等待设备就绪','warn');title='A · 等待设备就绪';subtitle='最多等待 1 秒，等待期间不发送运动指令；B 可取消'}
- else if(online&&c.homing){phase('回零中','warn');title='A · 正在回零';subtitle='低速回零确认后，锁定手柄参考'}
- else if(online&&c.recording){phase('遥操 · 录制中','good');title='运动与数据采集进行中';subtitle='B 或“停止运动”可结束当前轨迹'}
- else if(online&&(c.armed||c.teleop_enabled)){phase('已对齐 / 等待运动','good');title='参考对齐已完成';subtitle='手柄运动后开始录制'}
+ else if(online&&c.homing){phase('回零中','warn');title='正在回零';subtitle='A 启动遥操时重新锁定当前手柄与 TCP 参考'}
+ else if(online&&c.recording){phase(c.recording_paused?'保持 · 暂停写入':'遥操 · 录制中','good');title=c.recording_paused?'当前 Episode 已暂停写入':'运动与数据采集进行中';subtitle='按住把手 RG 跟随并续写，松开保持并暂停写入；B 结束当前轨迹并回零'}
+ else if(online&&(c.armed||c.teleop_enabled)){phase(c.following?'跟随中':'已对齐 / 保持','good');title='参考对齐已完成';subtitle=c.recording_error?'遥操可用 · 录制不可用，请查看日志':'按住把手 RG 才跟随；食指扳机控制夹爪'}
  else if(online&&(!c.control_ready||!q)){phase('设备未就绪','warn');title='等待机械臂反馈';subtitle='检查 CAN 和设备连接后再按手柄 A'}
- else if(online){phase(c.arm_enabled?'等待手柄 A':'未使能',c.arm_enabled?'good':'warn');title=c.arm_enabled?'机械臂已使能':'机械臂尚未使能';subtitle=p.running?'按手柄 A 回零并建立参考':'外部程序运行中 · 可观察及停止运动'}
+ else if(online){phase(c.arm_enabled?'等待手柄 A':'未使能',c.arm_enabled?'good':'warn');title=c.arm_enabled?'机械臂已使能':'机械臂尚未使能';subtitle=p.running?'按手柄 A 从当前姿态建立参考':'外部程序运行中 · 可观察及停止运动'}
  else if(p.running){phase('正在启动','warn');title='等待采集驱动反馈';subtitle='检查 CAN、Quest 和传感器连接'}
  else if(p.returncode!=null){phase(p.returncode===0?'已停止':'进程已退出',p.returncode===0?'':'bad');title='程序已退出';subtitle='启动进程返回码 '+p.returncode}
  else phase('未启动');
  text('run-title',title);text('run-subtitle',subtitle);
- const message=localMessage||err||(p.running&&!online&&s.server_time-(p.started_at||s.server_time)>15?'启动超过 15 秒仍无采集状态，请检查进程日志。':'');$('alert').hidden=!message;text('alert',message);
+ const message=localMessage||err||(online&&fault(c.recording_error)?'录制异常（遥操可继续）：'+fault(c.recording_error):'')||(p.running&&!online&&s.server_time-(p.started_at||s.server_time)>15?'启动超过 15 秒仍无采集状态，请检查进程日志。':'');$('alert').hidden=!message;text('alert',message);
  text('feedback-age',online?'状态 '+number(age,0)+' ms':age!=null?'反馈已断开':'等待反馈');
  $('connection-dot').className='dot good';text('connection','界面服务已连接');text('clock',new Date(s.server_time*1000).toLocaleTimeString('zh-CN',{hour12:false}));
  for(const row of document.querySelectorAll('.node')){const present=s.nodes.includes(row.dataset.node);row.firstChild.className='dot '+(present?'good':'');row.lastChild.textContent=!present?'未发现':row.dataset.node==='pub_pose_node'?(s.quest_age_ms!=null&&s.quest_age_ms<500?'有位姿':'等待位姿'):row.dataset.node==='agx_arm_ctrl_single_node'&&!online?'等待状态':'已发现'}
- let ready=0;for(const row of document.querySelectorAll('.sensor')){const stream=c.streams?.[row.dataset.stream],a=stream?.age_ms!=null&&online?stream.age_ms+Math.max(0,age-150):null,threshold=row.dataset.stream.startsWith('cameras/')?68:55;const good=a!=null&&a<=threshold;if(good)ready++;row.firstChild.className='dot '+(good?'good':a!=null?'bad':'');row.querySelector('small').textContent=labels[row.dataset.stream][1]+' · '+(a==null?'无数据':number(a,0)+' ms');row.querySelector('.rate').textContent=online&&stream?number(a!=null&&a<1000?stream.fps:0,1)+' Hz':'— Hz'}text('sensor-count',ready+' / 4');
+ let ready=0,total=0;for(const row of document.querySelectorAll('.sensor')){const key=row.dataset.stream;row.hidden=online&&c.streams!=null&&!(key in c.streams);if(row.hidden)continue;total++;const stream=c.streams?.[key],a=stream?.age_ms!=null&&online?stream.age_ms+Math.max(0,age-150):null,threshold=key.startsWith('cameras/')?68:55;const good=a!=null&&a<=threshold;if(good)ready++;row.firstChild.className='dot '+(good?'good':a!=null?'bad':'');const camera=c.cameras?.[key.split('/')[1]],type=camera?(camera.backend==='gopro'?'GoPro':'RealSense'):labels[key][1];row.querySelector('small').textContent=type+' · '+(a==null?'无数据':number(a,0)+' ms');row.querySelector('.rate').textContent=online&&stream?number(a!=null&&a<1000?stream.fps:0,1)+' Hz':'— Hz'}text('sensor-count',ready+' / '+total);
  $('joints').classList.toggle('offline-data',!fresh);
  let velocity=null;
  if(q&&fresh&&r.joint_host_ts_ns!==lastRobotStamp){
@@ -92,7 +94,7 @@ function update(s){
  const limits=boot.model.joints.filter(j=>/^joint[1-6]$/.test(j.name));
  document.querySelectorAll('.joint-row').forEach((row,i)=>{
   row.querySelector('.actual').textContent=q?number(deg(q[i])):'—';row.querySelector('.target').textContent=goal?number(deg(goal[i])):'—';row.querySelector('.velocity').textContent=fresh&&velocity?number(deg(velocity[i])):'—';row.querySelector('.error').textContent=q&&goal?number(deg(goal[i]-q[i])):'—';
-  const marker=row.querySelector('.limit-track i'),[lo,hi]=limits[i].limits;marker.style.left=q?Math.max(0,Math.min(100,(q[i]-lo)/(hi-lo)*100))+'%':'50%';marker.style.background=q&&(q[i]<lo-1e-6||q[i]>hi+1e-6)?'#ff7f86':'#40d5bd';row.querySelector('.error').classList.toggle('bad',q&&goal&&Math.abs(goal[i]-q[i])>boot.safety.max_target_lead_rad);
+  const marker=row.querySelector('.limit-track i'),[lo,hi]=limits[i].limits;marker.style.left=q?Math.max(0,Math.min(100,(q[i]-lo)/(hi-lo)*100))+'%':'50%';marker.style.background=q&&(q[i]<lo-1e-6||q[i]>hi+1e-6)?'#ff7f86':'#40d5bd';row.querySelector('.error').classList.remove('bad');
  });
  [...$('tcp-values').children].forEach((cell,i)=>{const v=r.tcp_pose?.[i];cell.lastChild.textContent=typeof v==='number'?number(i<3?v*1000:deg(v),1)+(i<3?' mm':' °'):'—'});
  text('gripper','夹爪 '+number(r.gripper_pos?.[0]*1000,1)+' mm');text('fk-error',online?number(c.fk_position_error_m*1000,2)+' mm':'— mm');
@@ -101,7 +103,7 @@ function update(s){
  const recording=online&&c.recording;text('episode',recording?String(c.recording).split('/').pop():c.homing&&online?'回零中 · 暂不录制':'未录制');
  const seconds=recording?c.recording_duration_s||0:0;text('duration',String(Math.floor(seconds/60)).padStart(2,'0')+':'+(seconds%60).toFixed(1).padStart(4,'0'));
  const mb=online?c.writer?.pending_mb||0:0,capacity=c.writer?.capacity_mb||256;text('queue-value',number(mb,1)+' / '+number(capacity,0)+' MiB');$('queue-fill').style.width=Math.min(100,mb/capacity*100)+'%';$('queue-fill').style.background=Math.max(mb/capacity,c.writer?.worst_fill||0)>.8?'#ff7f86':'#40d5bd';
- text('record-note',online&&c.writer?.finalizing?'正在封盘 '+c.writer.finalizing+' 条轨迹':recording?'原始图像与机器人状态异步写盘':'A 回零期间不录制');text('pid',p.pid?'launch PID '+p.pid:boot.demo?'离线演示 · 不启动真实进程':p.log_path?'完整日志已保存':online?'外部程序 · 不由本界面管理':'尚无启动进程');$('pid').title=p.log_path||'';
+ text('record-note',online&&c.writer?.finalizing?'正在封盘 '+c.writer.finalizing+' 条轨迹':recording?(c.recording_paused?'写入已暂停 · 保留当前 Episode':'原始图像与机器人状态异步写盘'):c.recording_error?'录制不可用 · 遥操继续':'A 对齐后按住 RG 开始录制');text('pid',p.pid?'launch PID '+p.pid:boot.demo?'离线演示 · 不启动真实进程':p.log_path?'完整日志已保存':online?'外部程序 · 不由本界面管理':'尚无启动进程');$('pid').title=p.log_path||'';
  const newLogs=(p.logs??[]).filter(row=>row.id>logCursor);logCursor=Math.max(logCursor,p.log_cursor??0);if(newLogs.length){logs.push(...newLogs);logs=logs.slice(-500);renderLogs()}
  updateButtons();drawCharts();
 }

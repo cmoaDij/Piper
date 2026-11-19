@@ -1,0 +1,16 @@
+{
+  "schema_version": "piper_calibration_v1",
+  "calibration_id": "calibration_gopro_v1",
+  "verified": false,
+  "arm_type": "piper_x",
+  "camera_serials": {
+    "wrist_rgb": "/dev/v4l/by-id/REPLACE_WITH_YOUR_CAPTURE_CARD-video-index0"
+  },
+  "tactile_ids": {
+    "left_raw": "X2631410810",
+    "right_raw": "X2631410795"
+  },
+  "tcp_offset": [0.0, 0.0, 0.195, 0.0, 0.0, 0.0],
+  "relative_offsets_ns": {"wrist_rgb": 0, "left_raw": 0, "right_raw": 0},
+  "tracking_lag_notes": "核对 GoPro/HDMI 采集卡、手腕安装位置、TCP 和左右触觉；使用 UMI QR 工具实测当前设备与视频模式的接收延迟后，再设置 verified=true。"
+}

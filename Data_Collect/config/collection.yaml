@@ -14,39 +14,48 @@ storage:
   video_quality: 18  # NVENC CQ / libx264 CRF；数值越小质量越高
 feedback_hz: 200
 control_hz: 50
-command_timeout_s: 0.25
 gripper_max_m: 0.07
 camera_timeout_ms: 500
 arm_type: piper_x
 urdf: ros_ws/src/agx_arm_description/agx_arm_urdf/piper_x/urdf/piper_x_with_gripper_description.urdf
 base_link: base_link
 tip_link: link6
-tcp_offset: [0.0, 0.0, 0.113, 0.0, 0.0, 0.0]
-motion:
-  home_tolerance_rad: 0.0087266463
-  home_timeout_s: 45.0
-  fk_position_tolerance_m: 0.01
-  fk_rotation_tolerance_rad: 0.0872664626
-  feedback_skew_s: 0.025
-  stationary_duration_s: 0.25
-  stationary_tolerance_rad: 0.0087266463
-  first_target_tolerance_rad: 0.0523598776
-  max_target_step_rad: 0.0872664626
-  max_command_step_rad: 0.0034906585  # 每次下发最多 0.2°
-  max_velocity_rad_s: 0.0872664626  # 每轴最多 5°/s
-  max_acceleration_rad_s2: 0.2617993878  # 每轴最多 15°/s²
-  max_target_lead_rad: 0.0523598776  # 下发目标与实测位置最多相差 3°
-  feedback_motion_window_s: 0.1
-  max_feedback_window_travel_rad: 0.0349065850  # 每轴实测累计变化最多 2°/100 ms
-  max_feedback_step_rad: 0.0261799388  # 相邻真实反馈单包最多变化 1.5°
-  max_tracking_error_rad: 0.1745329252
-  max_control_gap_s: 0.06
+tcp_offset: [0.0, 0.0, 0.195, 0.0, 0.0, 0.0]
+# Driver motion settings follow QuestArmTeleop's Piper-X launch; see delta_frame below.
+teleop:
+  coordinate_mode: relative  # relative 原有头显相对/TCP；world 使用独立 Quest LOCAL 输入
+  # Controller-frame correction from QuestArmTeleop's Piper-X launch, in radians.
+  ros_to_arm_rpy: [-1.5708, 0.0, -1.5708]
+  # Map controller-local changes into the captured TCP frame, as QuestArmTeleop does.
+  delta_frame: tcp
+  # Grip trigger (middle finger); the index trigger rightTrig controls the gripper.
+  follow_button: RG
+  fast_mode: true
+  speed_percent: 50
+  home_speed_percent: 5
+  home_position_tolerance: 0.03
+  auto_home_on_stop: true
+  auto_home_delay_s: 0.5
 cameras:
   global_rgb: {serial: "324422300699", width: 640, height: 480, fps: 30}
   wrist_rgb: {serial: "140122074456", width: 640, height: 480, fps: 30}
+# 完整 RealSense 组合连接时优先使用原方案；否则识别 GoPro HDMI/UVC。
+# 单台 GoPro 默认安装在手腕；两台时请分别配置稳定的 by-id 路径。
+camera_selection:
+  mode: auto  # auto / realsense / gopro；启动时选定，录制中不热切换
+  gopro:
+    calibration_id: calibration_gopro_v1
+    calibration_file: data/calibration/calibration_gopro_v1.json
+    cameras:
+      wrist_rgb:
+        device: auto
+        width: 1280
+        height: 960
+        fps: 60
+        receive_latency_file: data/calibration/gopro_wrist_latency.json
 tactile:
-  left_raw: {dev_id: "X2631410795", backend: cpu, mode: standard, max_fps: 60, color_order: bgr}
-  right_raw: {dev_id: "X2631410810", backend: cpu, mode: standard, max_fps: 60, color_order: bgr}
+  left_raw: {dev_id: "X2631410810", backend: cpu, mode: standard, max_fps: 60, color_order: bgr}
+  right_raw: {dev_id: "X2631410795", backend: cpu, mode: standard, max_fps: 60, color_order: bgr}
 audit:
   fps: 20
   min_duration_s: 5
@@ -61,9 +70,6 @@ audit:
   max_yellow_ratio: 0.02
   contact_window_s: 0.5
   gripper_change_m: 0.001
-  open_threshold_m: 0.05
-  closed_threshold_m: 0.02
-  require_gripper_cycle: true
   action_window_ms: 25
   action_max_hold_ms: 100
   stationary_joint_tolerance_rad: 0.003

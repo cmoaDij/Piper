@@ -8,8 +8,10 @@ from pathlib import Path
 import h5py
 import numpy as np
 
-from data_collect.common.config import IMAGE_STREAMS, ROOT, atomic_json, fingerprint, inside_data_collect
+from data_collect.common.config import IMAGE_STREAMS, ROOT, atomic_json, fingerprint, inside_data_collect, recorded_image_streams
 from data_collect.recording.images import EpisodeImages, image_shape, validate_images
+from data_collect.recording.timing import alignment_grid, observation_timestamps
+from data_collect.calibration.tracking import recorded_tracking, response_reference_indices, response_reference_values
 
 FEATURE_IMAGES = dict(
     zip(
@@ -35,6 +37,7 @@ def preflight(manifest_path, allow_simulated=False):
         raise ValueError("白名单为空；请先完成自动审计和人工通过")
     result, seen = [], set()
     shapes = None
+    timing_profiles = set()
     for entry in manifest["episodes"]:
         path = Path(entry["path"])
         sync_path = Path(entry["sync_path"])
@@ -61,30 +64,41 @@ def preflight(manifest_path, allow_simulated=False):
         ):
             raise ValueError("索引缓存与白名单不符")
         grid = np.asarray(sync["grid_host_ts_ns"], dtype=np.int64)
-        if len(grid) == 0 or np.any(np.diff(grid) != 50_000_000):
-            raise ValueError("索引缓存不是完整的 20Hz 网格")
         with h5py.File(path, "r") as f:
             if not f.attrs.get("complete") or f.attrs.get("collection_error"):
                 raise ValueError("白名单包含未完整采集的文件")
             if f.attrs.get("simulated", False) and not allow_simulated:
                 raise ValueError("包含合成数据；仅演练时显式指定 --allow-simulated")
-            expected = np.arange(
-                int(f.attrs["start_host_ts_ns"]),
-                int(f.attrs["end_host_ts_ns"]),
-                50_000_000,
-                dtype=np.int64,
-            )
+            expected, segments, intervals = alignment_grid(f, 20)
             if not np.array_equal(grid, expected):
-                raise ValueError("缓存切掉了 Episode 开头或结尾")
+                raise ValueError("缓存不包含完整的有效录制区间")
+            if not np.array_equal(sync.get("recording_segment", np.zeros(len(grid))), segments):
+                raise ValueError("缓存录制片段与源文件不一致")
+            tracking = recorded_tracking(f)
+            timing_profiles.add(tracking["profile_sha256"] if tracking else None)
+            if sync.get("robot_tracking_latency") != tracking:
+                raise ValueError("缓存机械臂延迟标定与原始记录不一致，请重新审计")
+            if tracking:
+                expected_reference = response_reference_indices(f, grid, segments, intervals)
+                cached_reference = np.asarray(sync.get("tracking_reference_indices"))
+                if (cached_reference.dtype.kind not in "iu"
+                        or not np.array_equal(cached_reference, expected_reference)):
+                    raise ValueError("缓存机械臂响应参考索引错误，请重新审计")
+            elif "tracking_reference_indices" in sync:
+                raise ValueError("未标定的录制不能带有响应参考索引")
             validate_images(f, decode=True)
-            current_shapes = {s: image_shape(f[s]) for s in IMAGE_STREAMS}
+            streams = recorded_image_streams(f)
+            if sync.get("image_streams", list(IMAGE_STREAMS)) != list(streams):
+                raise ValueError("缓存图像清单与源文件不一致")
+            current_shapes = {s: image_shape(f[s]) for s in streams}
             if shapes is not None and current_shapes != shapes:
-                raise ValueError("Episode 间图像尺寸不一致")
+                raise ValueError("Episode 间相机位置或图像尺寸不一致；不同相机方案请分别导出")
             shapes = current_shapes
-            for group in (*IMAGE_STREAMS, "robot_feedback", "robot_command"):
+            for group in (*streams, "robot_feedback", "robot_command"):
                 idx = np.asarray(sync["indices"][group])
                 ts_key = "cmd_call_begin_ns" if group == "robot_command" else "available_host_ts_ns"
-                ts = f[group + "/" + ts_key][:]
+                ts = (observation_timestamps(f[group]) if group in streams
+                      else f[group + "/" + ts_key][:])
                 if (
                     idx.dtype.kind not in "iu"
                     or idx.shape != grid.shape
@@ -94,13 +108,19 @@ def preflight(manifest_path, allow_simulated=False):
                     raise ValueError(f"{group} 缓存索引越界或长度不符")
                 if group != "robot_command" and (ts[idx] > grid).any():
                     raise ValueError("观测缓存引用了未来帧")
+                if f.attrs.get("recording_mode") == "grip_paused":
+                    source_segments = f[group + "/recording_segment"][:]
+                    if (source_segments[idx] != segments).any():
+                        raise ValueError("缓存跨越了暂停边界")
         result.append({**entry, "path": str(path), "sync_path": str(sync_path), "sync": sync})
+    if len(timing_profiles) != 1:
+        raise ValueError("不同机械臂延迟标定或未标定的 Episode 请分别导出")
     # Both partitions share one continuous episode index, with contiguous split ranges.
     result.sort(key=lambda entry: entry["split"] == "val")
     return manifest, result, shapes
 
 
-def feature_schema(shapes):
+def feature_schema(shapes, with_tracking=False):
     features = {
         key: {"dtype": "float32", "shape": (7,), "names": names}
         for key, names in (
@@ -111,12 +131,21 @@ def feature_schema(shapes):
         )
     }
     for stream, key in FEATURE_IMAGES.items():
+        if stream not in shapes:
+            continue
         # Tac-X is stored as lossless PNG-backed image features, embedded in Parquet by LeRobot.
         features[key] = {
             "dtype": "video" if stream.startswith("cameras/") else "image",
             "shape": tuple(shapes[stream]),
             "names": ["height", "width", "channels"],
         }
+    # Timing metadata stays outside observation.*, so it is not a policy input.
+    features["recording_segment"] = {"dtype": "int64", "shape": (1,), "names": ["segment"]}
+    features["source_host_ts_ns"] = {"dtype": "int64", "shape": (1,), "names": ["host_ts_ns"]}
+    if with_tracking:
+        # Diagnostic fields stay outside observation/action policy features.
+        features["tracking.reference"] = {"dtype": "float32", "shape": (7,), "names": JOINT_NAMES}
+        features["tracking.valid"] = {"dtype": "int64", "shape": (7,), "names": JOINT_NAMES}
     return features
 
 
@@ -126,12 +155,17 @@ def aligned_frames(file, sync):
 
 
 def _aligned_frames(file, sync, images):
+    segments = sync.get("recording_segment")
+    tracking = (response_reference_values(file, sync["tracking_reference_indices"])
+                if "tracking_reference_indices" in sync else None)
     for k in range(len(sync["grid_host_ts_ns"])):
         i = sync["indices"]["robot_feedback"][k]
         j = sync["indices"]["robot_command"][k]
         actual_grip = file["robot_feedback/gripper_pos"][i]
         target_grip = file["robot_command/target_gripper_pos"][j]
         frame = {
+            "recording_segment": np.array([segments[k] if segments is not None else 0], dtype=np.int64),
+            "source_host_ts_ns": np.array([sync["grid_host_ts_ns"][k]], dtype=np.int64),
             "observation.state": np.r_[file["robot_feedback/joint_pos"][i], actual_grip].astype(
                 np.float32
             ),
@@ -147,7 +181,12 @@ def _aligned_frames(file, sync, images):
             "task": str(file.attrs["task_instruction"]),
         }
         for stream, key in FEATURE_IMAGES.items():
+            if stream not in sync["indices"]:
+                continue
             frame[key] = images.read(stream, sync["indices"][stream][k])
+        if tracking is not None:
+            frame["tracking.reference"] = tracking[0][k]
+            frame["tracking.valid"] = tracking[1][k]
         yield frame
 
 
@@ -169,7 +208,7 @@ def convert(manifest_path, output, repo_id, allow_simulated=False, dataset_class
     kwargs = {
         "repo_id": repo_id,
         "fps": 20,
-        "features": feature_schema(shapes),
+        "features": feature_schema(shapes, with_tracking=bool(entries[0]["sync"].get("robot_tracking_latency"))),
         "root": staging,
         "robot_type": "piper",
         "use_videos": True,
@@ -199,6 +238,11 @@ def convert(manifest_path, output, repo_id, allow_simulated=False, dataset_class
                     "source_sha256": entry["source_sha256"],
                     "split": entry["split"],
                     "frames": len(entry["sync"]["grid_host_ts_ns"]),
+                    "recording_intervals_host_ts_ns": entry["sync"].get("recording_intervals_host_ts_ns"),
+                    "recording_segment": entry["sync"].get("recording_segment"),
+                    "image_streams": entry["sync"].get("image_streams", list(IMAGE_STREAMS)),
+                    "timestamp_policy": entry["sync"].get("timestamp_policy", "available_host_time_v1"),
+                    "robot_tracking_latency": entry["sync"].get("robot_tracking_latency"),
                 }
             )
         dataset.finalize()
@@ -218,6 +262,13 @@ def convert(manifest_path, output, repo_id, allow_simulated=False, dataset_class
             info["splits"]["val"] = f"{ntrain}:{len(entries)}"
         atomic_json(info_path, info)
         atomic_json(staging / "meta" / "source_episodes.json", mapping)
+        if entries[0]["sync"].get("robot_tracking_latency"):
+            atomic_json(staging / "meta" / "robot_tracking_latency.json", {
+                "calibration": entries[0]["sync"]["robot_tracking_latency"],
+                "action_semantics": "target at SDK send time; execution delay is preserved",
+                "tracking_reference_semantics": "estimated responding past target, diagnostics only",
+                "state_timestamps_shifted": False,
+            })
         atomic_json(
             staging / "meta" / "split_episodes.json",
             {

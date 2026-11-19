@@ -33,20 +33,6 @@ def pose_to_mat(pose: Pose) -> np.ndarray:
     return mat
 
 
-def limit_tcp_step(previous, requested, translation_limit, rotation_limit):
-    """Interpolate toward the current hand target; never queue old targets."""
-    if requested.shape != (4, 4) or not np.isfinite(requested).all():
-        raise ValueError("TCP 目标必须为有限的 4×4 位姿")
-    delta = requested[:3, 3] - previous[:3, 3]
-    rotation = Rotation.from_matrix(previous[:3, :3].T @ requested[:3, :3]).as_rotvec()
-    distance, angle = np.linalg.norm(delta), np.linalg.norm(rotation)
-    fraction = min(1., translation_limit / max(distance, 1e-12), rotation_limit / max(angle, 1e-12))
-    result = previous.copy()
-    result[:3, 3] += fraction * delta
-    result[:3, :3] = previous[:3, :3] @ Rotation.from_rotvec(fraction * rotation).as_matrix()
-    return result
-
-
 class ArmIK:
     def __init__(
         self,
@@ -71,13 +57,7 @@ class ArmIK:
         viewer_axis_length: float,
         viewer_axis_width: float,
         tcp_offset_rpy=None,
-        position_tolerance_m=0.01,
-        rotation_tolerance_rad=0.0872664626,
     ):
-        if not all(np.isfinite(v) and v > 0 for v in (position_tolerance_m, rotation_tolerance_rad, w_pos, w_ori)):
-            raise ValueError("IK 权重和精度门限必须为有限正数")
-        if not all(np.isfinite(v) and v >= 0 for v in (w_reg, w_smooth)):
-            raise ValueError("IK 正则和平滑权重必须为有限非负数")
         self.robot = pin.RobotWrapper.BuildFromURDF(urdf_path, package_dirs=package_dirs)
         unique_locked_joints = self._deduplicate_locked_joints(locked_joints)
         self.reduced_robot = self.robot.buildReducedRobot(
@@ -146,11 +126,6 @@ class ArmIK:
         regularization = casadi.sumsqr(self.var_q - self.param_q_feedback)
         smooth_cost = casadi.sumsqr(self.var_q - self.param_q_prev)
         self.opti.minimize(total_cost + w_reg * regularization + w_smooth * smooth_cost)
-        # Precision must be feasible inside the optimization, rather than a
-        # conflicting check applied only after accepting a soft-cost solution.
-        self.opti.subject_to(casadi.sumsqr(pos_error) <= position_tolerance_m ** 2)
-        self.opti.subject_to(casadi.sumsqr(ori_error) <= rotation_tolerance_rad ** 2)
-
         self.opti.subject_to(
             self.opti.bounded(
                 self.reduced_robot.model.lowerPositionLimit,
@@ -216,8 +191,13 @@ class ArmIK:
             self._state_synced = True
 
     def accept(self, q):
-        """Commit continuity state only after all checks and publication pass."""
+        """Commit continuity state after publishing the solved joint target."""
         self.init_data = np.asarray(q, dtype=float).copy()
+        self.history_data = self.init_data.copy()
+
+    def rebase(self, q):
+        """Start a clutch segment at the joint setpoint actually held downstream."""
+        self.sync_state(q)
         self.history_data = self.init_data.copy()
 
     def solve(self, target_pose: np.ndarray) -> np.ndarray:
@@ -231,11 +211,7 @@ class ArmIK:
         self.last_solve = {}
         try:
             self.opti.solve_limited()
-            if not self.opti.stats().get("success", False):
-                raise ValueError("IK 未收敛")
             sol_q = np.array(self.opti.value(self.var_q)).reshape(-1)
-            if not np.isfinite(sol_q).all():
-                raise ValueError("IK 产生非有限关节角")
         finally:
             self.last_solve["solve_ms"] = round((time.monotonic() - begin) * 1000, 3)
             try:
@@ -314,11 +290,6 @@ class ArmIKPoseNode(Node):
         self.declare_parameter("tool_pre_rot_rpy", [-1.57, 0.0, -1.57])
         self.declare_parameter("tool_translation_xyz", [0.0, 0.023, 0.064])
         self.declare_parameter("tcp_offset_rpy", [0.0, 0.0, 0.0])
-        self.declare_parameter("require_start_alignment", False)
-        self.declare_parameter("alignment_position_tolerance_m", 0.01)
-        self.declare_parameter("alignment_rotation_tolerance_rad", 0.0872664626)
-        self.declare_parameter("max_tcp_step_m", 0.002)
-        self.declare_parameter("max_tcp_step_rad", 0.01745329252)
         self.declare_parameter("collision_pairs_flat", [5, 0, 5, 1, 5, 2, 5, 3])
         self.declare_parameter("enable_collision_check", False)
 
@@ -337,6 +308,8 @@ class ArmIKPoseNode(Node):
 
         self.declare_parameter("pose_stamped_topic", "")
         self.declare_parameter("feedback_joint_topic", "")
+        # Optional: other Quest launch files keep their absolute-pose interface.
+        self.declare_parameter("reference_joint_topic", "")
         self.declare_parameter("pin_joint_status_topic", "pin_joint_status")
         self.declare_parameter("simulation_feedback", False)
         self.declare_parameter("simulation_feedback_joint_topic", "")
@@ -373,6 +346,13 @@ class ArmIKPoseNode(Node):
 
         pose_stamped_topic = str(self.get_parameter("pose_stamped_topic").value).strip()
         feedback_joint_topic = str(self.get_parameter("feedback_joint_topic").value).strip()
+        reference_joint_topic = str(self.get_parameter("reference_joint_topic").value).strip()
+        self.use_clutch_reference = bool(reference_joint_topic)
+        self.reference_joint = None
+        self.reference_model_pose = None
+        self.reference_input_pose = None
+        self.reference_stamp_ns = 0
+        self.reference_key = ""
         pin_joint_status_topic = str(self.get_parameter("pin_joint_status_topic").value).strip()
         self.simulation_feedback = bool(self.get_parameter("simulation_feedback").value)
         simulation_feedback_joint_topic = str(
@@ -409,8 +389,6 @@ class ArmIKPoseNode(Node):
             viewer_axis_length=viewer_axis_length,
             viewer_axis_width=viewer_axis_width,
             tcp_offset_rpy=list(self.get_parameter("tcp_offset_rpy").value),
-            position_tolerance_m=float(self.get_parameter("alignment_position_tolerance_m").value),
-            rotation_tolerance_rad=float(self.get_parameter("alignment_rotation_tolerance_rad").value),
         )
         dedup_locked = self.ik._deduplicate_locked_joints(locked_joints)
         self.get_logger().info(f"locked_joints(raw)={locked_joints}, locked_joints(dedup)={dedup_locked}")
@@ -418,24 +396,8 @@ class ArmIKPoseNode(Node):
         output_joint_names = list(self.get_parameter("output_joint_names").value)
         #self.output_joint_names = output_joint_names if len(output_joint_names) == self.ik.nq else self.ik.active_joint_names()
         self.output_joint_names = output_joint_names
-        self.require_start_alignment = bool(self.get_parameter("require_start_alignment").value)
-        self.alignment_position_tolerance = float(self.get_parameter("alignment_position_tolerance_m").value)
-        self.alignment_rotation_tolerance = float(self.get_parameter("alignment_rotation_tolerance_rad").value)
-        self._teleop_active = not self.require_start_alignment
-        self._needs_alignment = True
-        self._feedback_q = None
-        self._feedback_received_ns = 0
-        self._reference_correction = np.eye(4)
-        self._reference_q = None
-        self._reference_pose = None
-        self._last_accepted_pose = None
         self._ik_warmed = False
-        self.max_tcp_step_m = float(self.get_parameter("max_tcp_step_m").value)
-        self.max_tcp_step_rad = float(self.get_parameter("max_tcp_step_rad").value)
-        if not all(np.isfinite(v) and v > 0 for v in (self.max_tcp_step_m, self.max_tcp_step_rad)):
-            raise ValueError("TCP 步长必须为有限正数")
-        self.create_subscription(Bool, "/teleop/enabled", self.teleop_enabled_callback, 10)
-        
+
         self.pub_joint = self.create_publisher(JointState, pin_joint_status_topic, 10)
         self.pub_collision = self.create_publisher(Bool, f"{pin_joint_status_topic}_collision", 10)
         self.enable_collision_check = enable_collision_check
@@ -444,6 +406,8 @@ class ArmIKPoseNode(Node):
             self.create_subscription(PoseStamped, pose_stamped_topic, self.pose_stamped_callback, 10)
         if feedback_joint_topic:
             self.create_subscription(JointState, feedback_joint_topic, self.feedback_joint_callback, 10)
+        if reference_joint_topic:
+            self.create_subscription(JointState, reference_joint_topic, self.reference_joint_callback, 10)
         if not pose_stamped_topic:
             raise ValueError("pose_stamped_topic cannot be empty.")
 
@@ -481,11 +445,9 @@ class ArmIKPoseNode(Node):
         if all(name in values for name in names):
             q = np.array([values[name] for name in names], dtype=float)
             if np.isfinite(q).all():
-                self._feedback_q = q
-                self._feedback_received_ns = self.get_clock().now().nanoseconds
                 self.ik.sync_state(q.tolist())
-                if not self._ik_warmed and not self._teleop_active:
-                    # Compile/load the solver before A can start a 250 ms target watchdog.
+                if not self._ik_warmed:
+                    # Compile/load once without publishing a motion target.
                     self._ik_warmed = True
                     try:
                         self.ik.solve(self.ik.end_effector_pose(q))
@@ -494,13 +456,47 @@ class ArmIKPoseNode(Node):
                         self._ik_warmed = False
                         self.get_logger().warning(f"IK 预热未通过：{exc}")
 
-    def teleop_enabled_callback(self, msg: Bool) -> None:
-        self._teleop_active = msg.data
-        self._needs_alignment = True
-        self._last_accepted_pose = None
+    def reference_joint_callback(self, msg: JointState) -> None:
+        values = dict(zip(msg.name, msg.position))
+        names = self.ik.active_joint_names()
+        if not all(name in values for name in names):
+            return
+        q = np.array([values[name] for name in names], dtype=float)
+        if not np.isfinite(q).all():
+            return
+        self.ik.rebase(q)
+        self.reference_joint = q.copy()
+        self.reference_model_pose = self.ik.end_effector_pose(q)
+        self.reference_input_pose = None
+        self.reference_stamp_ns = msg.header.stamp.sec * 1_000_000_000 + msg.header.stamp.nanosec
+        self.reference_key = msg.header.frame_id
+        self.get_logger().info("RG：IK 已对齐下游保持目标，等待本段首个手柄目标")
 
     def pose_stamped_callback(self, msg: PoseStamped) -> None:
-        self._solve_and_publish(pose_to_mat(msg.pose), stamp=msg.header.stamp)
+        target = pose_to_mat(msg.pose)
+        hold_joint = None
+        if self.use_clutch_reference:
+            stamp_ns = msg.header.stamp.sec * 1_000_000_000 + msg.header.stamp.nanosec
+            if self.reference_joint is None or stamp_ns < self.reference_stamp_ns:
+                return
+            if self.reference_input_pose is None:
+                self.reference_input_pose = target.copy()
+                self.get_logger().info("RG：首帧重复原关节目标，无零增量 IK 运动")
+            # The input already maps controller motion into base axes using the
+            # existing TCP formula. Preserve those increments exactly, replacing
+            # only their absolute origin with FK of the held joint command.
+            rebased = self.reference_model_pose.copy()
+            rebased[:3, 3] += target[:3, 3] - self.reference_input_pose[:3, 3]
+            rebased[:3, :3] = (
+                target[:3, :3] @ self.reference_input_pose[:3, :3].T
+                @ self.reference_model_pose[:3, :3]
+            )
+            # Roundoff tolerance, not a controller motion deadband. Avoid solving
+            # a zero increment back into a different (regularized) joint target.
+            if np.allclose(target, self.reference_input_pose, rtol=0., atol=1e-12):
+                hold_joint = self.reference_joint
+            target = rebased
+        self._solve_and_publish(target, stamp=msg.header.stamp, hold_joint=hold_joint)
 
     def _publish_simulation_feedback(self, stamp=None) -> None:
         """Publish simulated state so delta teleoperation can rebase without a real arm."""
@@ -538,79 +534,27 @@ class ArmIKPoseNode(Node):
             )
         return q[: len(self.output_joint_names)].tolist()
 
-    def _solve_and_publish(self, target_pose: np.ndarray, stamp) -> None:
-        if not self._teleop_active:
-            return
-        requested_pose = target_pose.copy()
-        limited_pose = None
-        self.ik.last_solve = {}
+    def _solve_and_publish(self, target_pose: np.ndarray, stamp, hold_joint=None) -> None:
         try:
-            first_alignment = False
-            if self.require_start_alignment:
-                if self._feedback_q is None or not 0 <= self.get_clock().now().nanoseconds - self._feedback_received_ns <= 250_000_000:
-                    raise ValueError("无新鲜六轴反馈，拒绝 IK 输出")
-                if self._needs_alignment:
-                    model_pose = self.ik.end_effector_pose(self._feedback_q)
-                    distance = np.linalg.norm(model_pose[:3, 3] - target_pose[:3, 3])
-                    angle = Rotation.from_matrix(model_pose[:3, :3].T @ target_pose[:3, :3]).magnitude()
-                    if distance > self.alignment_position_tolerance or angle > self.alignment_rotation_tolerance:
-                        raise ValueError(f"启动 TCP 与模型不符：{distance * 1000:.1f} mm / {np.rad2deg(angle):.2f}°")
-                    self._reference_correction = model_pose @ np.linalg.inv(target_pose)
-                    self._reference_q = self._feedback_q.copy()
-                    self._reference_pose = model_pose.copy()
-                    self._last_accepted_pose = model_pose.copy()
-                    self.ik.accept(self._feedback_q)
-                    self._needs_alignment = False
-                    first_alignment = True
-                    self.get_logger().info("IK 已对齐实测关节与当前 TCP；首条输出保持实际关节角")
-                target_pose = self._reference_correction @ target_pose
-                requested_pose = target_pose.copy()
-                if first_alignment:
-                    sol_q = self._reference_q.copy()
-                    target_pose = self._reference_pose.copy()
-                else:
-                    target_pose = limit_tcp_step(self._last_accepted_pose, target_pose, self.max_tcp_step_m, self.max_tcp_step_rad)
-                    limited_pose = target_pose.copy()
-                    sol_q = self.ik.solve(target_pose)
-            else:
-                previous = self._last_accepted_pose if self._last_accepted_pose is not None else self.ik.end_effector_pose(self.ik.history_data)
-                target_pose = limit_tcp_step(previous, target_pose, self.max_tcp_step_m, self.max_tcp_step_rad)
-                limited_pose = target_pose.copy()
-                sol_q = self.ik.solve(target_pose)
-            model_pose = self.ik.end_effector_pose(sol_q)
-            distance = np.linalg.norm(model_pose[:3, 3] - target_pose[:3, 3])
-            angle = Rotation.from_matrix(model_pose[:3, :3].T @ target_pose[:3, :3]).magnitude()
-            if distance > self.alignment_position_tolerance or angle > self.alignment_rotation_tolerance:
-                raise ValueError(f"IK 末端误差超限: {distance*1000:.3f} mm / {np.rad2deg(angle):.3f}°")
+            sol_q = self.ik.solve(target_pose) if hold_joint is None else hold_joint.copy()
             joint_msg = JointState()
             joint_msg.header.stamp = stamp
+            joint_msg.header.frame_id = getattr(self, "reference_key", "")
             joint_msg.name = self.output_joint_names
             joint_msg.position = self._output_positions(sol_q)
             self.pub_joint.publish(joint_msg)
             self.ik.accept(sol_q)
-            self._last_accepted_pose = model_pose.copy()
-
             if self.simulation_feedback:
                 self._simulated_q = sol_q
                 self._publish_simulation_feedback(stamp)
-
             if self.enable_collision_check:
                 col_msg = Bool()
                 col_msg.data = self.ik.check_self_collision(sol_q)
                 self.pub_collision.publish(col_msg)
-        except Exception as e:
-            def description(pose):
-                if pose is None or not np.isfinite(pose).all():
-                    return None
-                return {"xyz_m": pose[:3, 3].round(6).tolist(), "quat_xyzw": Rotation.from_matrix(pose[:3, :3]).as_quat().round(6).tolist()}
-            details = {
-                "reason": str(e), "requested_tcp": description(requested_pose),
-                "limited_tcp": description(limited_pose), "limit_mm": self.alignment_position_tolerance*1000,
-                "limit_deg": float(np.rad2deg(self.alignment_rotation_tolerance)),
-                "feedback_age_ms": (self.get_clock().now().nanoseconds-self._feedback_received_ns)/1e6 if self._feedback_received_ns else None,
-                **self.ik.last_solve,
-            }
-            self.get_logger().warning("IK solve failed: " + json.dumps(details, ensure_ascii=False))
+        except Exception as exc:
+            self.get_logger().warning("IK solve failed: " + json.dumps(
+                {"reason": str(exc), **self.ik.last_solve}, ensure_ascii=False
+            ))
 
 
 def main(args=None):

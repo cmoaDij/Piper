@@ -13,74 +13,61 @@ JOINT_NAMES = tuple(f"joint{i}" for i in range(1, 7))
 
 
 class TeleopTarget:
-    """Combine fresh arm/gripper inputs for one enabled collection session."""
+    """Aggregate the reference teleop's partial finite joint/gripper commands."""
 
-    def __init__(self, limits, timeout_s=0.25, gripper_max_m=0.07):
-        self.limits = dict(limits)
-        self.timeout_ns = int(timeout_s * 1e9)
-        self.gripper_max_m = gripper_max_m
+    def __init__(self):
         self.enabled = False
         self.values = {}
-        self.timestamps = {}
 
     def set_enabled(self, enabled):
         self.enabled = bool(enabled)
         self.values.clear()
-        self.timestamps.clear()
 
-    def update(self, names, positions, now_ns):
-        if not self.enabled:
-            return False
-        names, positions = tuple(names), tuple(positions)
-        allowed = set(JOINT_NAMES) | {"gripper"}
-        if not names or len(names) != len(positions) or len(set(names)) != len(names):
-            return False
-        if not set(names) <= allowed:
-            return False
-        arm_names = set(names) & set(JOINT_NAMES)
-        if arm_names and arm_names != set(JOINT_NAMES):
-            return False
-        try:
-            values = {name: float(value) for name, value in zip(names, positions)}
-        except (TypeError, ValueError):
-            return False
-        for name, value in values.items():
-            low, high = (0.0, self.gripper_max_m) if name == "gripper" else self.limits[name]
-            if not math.isfinite(value) or not low <= value <= high:
-                return False
-        self.values.update(values)
-        self.timestamps.update({name: int(now_ns) for name in names})
-        return True
+    def update(self, names, positions):
+        if not self.enabled or len(names) != len(positions):
+            return
+        allowed = {*JOINT_NAMES, "gripper"}
+        for name, position in zip(names, positions):
+            if name in allowed and math.isfinite(position):
+                self.values[name] = float(position)
 
-    def snapshot(self, now_ns):
+    def snapshot(self):
         names = (*JOINT_NAMES, "gripper")
         if not self.enabled or any(name not in self.values for name in names):
-            return None
-        if any(not 0 <= now_ns - self.timestamps[name] <= self.timeout_ns for name in names):
             return None
         return [self.values[name] for name in names]
 
 
 class RobotObserver:
-    def __init__(self, manager, fk=None):
+    def __init__(self, manager, fk=None, tracking_latency=None):
         self.manager = manager
         self.fk = fk
         self.lock = threading.RLock()
         self.target_joint = None
         self.target_gripper = None
+        self.following = False
         self.seq = 0
         self.packet_ts = {}
         self.available_ts = {}
         self.timings = Timings()
+        self.tracking_latency = tracking_latency
+        self.joint_command_begin = self.gripper_command_begin = None
 
     def command(self, kind, value, begin, end):
         if kind == "joint":
             self.target_joint = np.asarray(value, dtype=np.float32).copy()
+            self.joint_command_begin = begin
         else:
             self.target_gripper = np.array([value], dtype=np.float32)
+            self.gripper_command_begin = begin
         if self.target_joint is None or self.target_gripper is None:
             return
         self.seq += 1
+        timing_fields = {}
+        if self.tracking_latency:
+            from data_collect.calibration.tracking import response_fields
+
+            timing_fields = response_fields(self.joint_command_begin, self.gripper_command_begin, self.tracking_latency)
         self.manager.emit(
             "robot_command",
             {
@@ -89,6 +76,8 @@ class RobotObserver:
                 "cmd_call_begin_ns": np.int64(begin),
                 "cmd_call_end_ns": np.int64(end),
                 "cmd_seq": np.int64(self.seq),
+                "following": np.bool_(self.following),
+                **timing_fields,
             },
         )
 

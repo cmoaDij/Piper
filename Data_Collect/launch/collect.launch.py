@@ -33,13 +33,16 @@ from launch import LaunchDescription
 from launch.actions import (
     DeclareLaunchArgument,
     ExecuteProcess,
+    LogInfo,
     OpaqueFunction,
+    RegisterEventHandler,
     SetEnvironmentVariable,
 )
 from launch.conditions import IfCondition
+from launch.event_handlers import OnProcessIO, OnProcessExit
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
-from launch_ros.parameter_descriptions import ParameterValue
+from launch.logging import launch_config
 
 sys.path.insert(0, str(ROOT))
 
@@ -49,79 +52,130 @@ def _launch(context):
 
     cfg_path = LaunchConfiguration("config").perform(context)
     cfg = load_config(cfg_path)
+    verbose = LaunchConfiguration("verbose").perform(context) == "true"
+    # The ROS alias "log" still echoes stderr. Use an explicit destination
+    # so only the filtered IO handler writes to the terminal in concise mode.
+    output = "screen" if verbose else {"both": "log"}
+    console_actions = []
+    if not verbose:
+        from data_collect.common.console import CollectionConsole
+
+        console = CollectionConsole(lambda line: print(line, flush=True))
+        console_actions = [
+            RegisterEventHandler(OnProcessIO(on_stdout=console.on_output, on_stderr=console.on_output)),
+            RegisterEventHandler(OnProcessExit(on_exit=console.on_exit)),
+        ]
     shares = {}
     for name in ("oculus_reader", "agx_arm_ctrl", "agx_arm_msgs", "agx_arm_description"):
         shares[name] = Path(get_package_share_directory(name)).resolve()
         if not shares[name].is_relative_to(ROOT / "ros_ws"):
             raise RuntimeError(f"{name} 不是内部包；请 source {ROOT}/env.sh")
+
+    def teleop_option(name):
+        override = LaunchConfiguration(name).perform(context)
+        return override or str(cfg["teleop"][name]).lower()
+
+    coordinate_mode = teleop_option("coordinate_mode")
+    if coordinate_mode not in ("relative", "world"):
+        raise ValueError("coordinate_mode 必须为 relative/world")
+    delta_frame = teleop_option("delta_frame")
+    if coordinate_mode == "world":
+        if LaunchConfiguration("delta_frame").perform(context) == "tcp":
+            raise ValueError("世界坐标模式不能与 delta_frame:=tcp 同时使用")
+        delta_frame = "base"
+        # Fail before starting the CAN driver if world input cannot start.
+        if LaunchConfiguration("quest_input").perform(context) == "true":
+            from data_collect.sensors.quest_world import adb_serial, PACKAGE
+            import subprocess
+            serial = adb_serial()
+            installed = subprocess.run(["adb", "-s", serial, "shell", "pm", "path", PACKAGE],
+                                       check=True, capture_output=True, text=True, timeout=10)
+            if not installed.stdout.strip().startswith("package:"):
+                raise RuntimeError("请先执行 python -m data_collect.cli.quest_world --install 安装世界坐标 APK")
+
+    controller_rpy = [
+        float(LaunchConfiguration("ros_to_arm_" + axis).perform(context) or default)
+        for axis, default in zip(("roll", "pitch", "yaw"), cfg["teleop"]["ros_to_arm_rpy"])
+    ]
     params = ["--ros-args"]
     values = {
         "can_port": LaunchConfiguration("can_port").perform(context),
         "arm_type": cfg["arm_type"],
         "effector_type": "agx_gripper",
         "pub_rate": "30",
-        "fast_mode": LaunchConfiguration("fast_mode").perform(context),
+        "fast_mode": teleop_option("fast_mode"),
         "auto_enable": LaunchConfiguration("auto_enable").perform(context),
-        "speed_percent": LaunchConfiguration("speed_percent").perform(context),
-        "home_speed_percent": LaunchConfiguration("home_speed_percent").perform(context),
-        "home_position_tolerance": str(cfg["motion"]["home_tolerance_rad"]),
+        "speed_percent": teleop_option("speed_percent"),
+        "home_speed_percent": teleop_option("home_speed_percent"),
+        "home_position_tolerance": str(cfg["teleop"]["home_position_tolerance"]),
         "tcp_offset": str(cfg["tcp_offset"]),
-        "control_enabled": "false",
-        "external_command_watchdog_enabled": "true",
-        "external_command_timeout": str(cfg["command_timeout_s"]),
+        "control_enabled": "true",
+        "external_command_watchdog_enabled": "false",
     }
     for name, value in values.items():
         params.extend(["-p", f"{name}:={value}"])
+    collector_options = ["--config", cfg_path, "--coordinate-mode", coordinate_mode, "--delta-frame", delta_frame]
+    teleop_only = LaunchConfiguration("teleop_only").perform(context) == "true"
+    if teleop_only:
+        collector_options.append("--teleop-only")
     return [
+        *console_actions,
+        LogInfo(msg=(f"[启动] {cfg['arm_type']} | CAN {LaunchConfiguration('can_port').perform(context)}"
+                     f" | 控制 {cfg['control_hz']} Hz | 配置 {local_path(cfg_path).name}"
+                     f" | 模式 {'仅遥操（不录制）' if teleop_only else '采集（A 对齐，RG 录制）'}"
+                     f" | 坐标 {'世界 LOCAL / 固定基座方向' if coordinate_mode == 'world' else '原有相对 / ' + delta_frame}"
+                     f" | 完整终端日志: {launch_config.log_dir}/launch.log")),
         SetEnvironmentVariable("PYTHONPATH", str(ROOT) + os.pathsep + os.environ.get("PYTHONPATH", "")),
+        # SDK print() output should appear during startup, not flush in a
+        # misleading burst after Ctrl-C alongside the SDK's logging output.
+        SetEnvironmentVariable("PYTHONUNBUFFERED", "1"),
         SetEnvironmentVariable("ROS_LOG_DIR", str(Path(cfg["data_root"]) / "logs")),
         ExecuteProcess(
-            cmd=[sys.executable, "-m", "data_collect.application.collector", "--config", cfg_path, *params],
+            cmd=[sys.executable, "-m", "data_collect.application.collector", *collector_options, *params],
             cwd=str(ROOT),
-            output="screen",
+            output=output,
         ),
         Node(
             package="oculus_reader",
             executable="arm_ik_pose_node.py",
-            output="screen",
+            output=output,
             parameters=[
                 str(shares["oculus_reader"] / "config/arm_ik_pose_node.piper.yaml"),
                 {
                     "pin_joint_status_topic": "/teleop/joint_states",
+                    "reference_joint_topic": "/teleop/ik_reference",
                     "robot_description_package": "agx_arm_description",
                     "urdf_relative_path": str(local_path(cfg["urdf"]).relative_to(ROOT / "ros_ws/src/agx_arm_description")),
                     "tool_pre_rot_rpy": [0.0, 0.0, 0.0],
                     "tool_translation_xyz": cfg["tcp_offset"][:3],
                     "tcp_offset_rpy": cfg["tcp_offset"][3:],
-                    "require_start_alignment": True,
-                    "alignment_position_tolerance_m": cfg["motion"]["fk_position_tolerance_m"],
-                    "alignment_rotation_tolerance_rad": cfg["motion"]["fk_rotation_tolerance_rad"],
                 },
             ],
         ),
         Node(
             package="oculus_reader",
-            executable="pub_pose.py",
-            output="screen",
+            executable="pub_quest_world.py" if coordinate_mode == "world" else "pub_pose.py",
+            output=output,
             condition=IfCondition(LaunchConfiguration("quest_input")),
-            parameters=[{"oculus_ip": "", "ros_to_arm_rpy": [0.0, 1.0471, 0.0]}],
+            parameters=[{"oculus_ip": "", "ros_to_arm_rpy": controller_rpy}],
         ),
         Node(
             package="oculus_reader",
             executable="pub_delta_pose.py",
-            output="screen",
+            output=output,
             condition=IfCondition(LaunchConfiguration("quest_input")),
             parameters=[
                 {
                     "oculus_ip": "",
-                    "translation_scale": [1.2, 1.2, 1.2],
+                    "translation_scale": [1.0, 1.0, 1.0],
+                    "coordinate_mode": coordinate_mode,
+                    "delta_frame": delta_frame,
                     "gripper_max_range": cfg["gripper_max_m"],
                     "control_joint_topic": "/teleop/joint_states",
                     "reset_button": "RJ",
-                    "auto_home_on_stop": ParameterValue(
-                        LaunchConfiguration("auto_home_on_stop"), value_type=bool
-                    ),
-                    "auto_home_delay_s": 0.5,
+                    "follow_button": cfg["teleop"]["follow_button"],
+                    "auto_home_on_stop": teleop_option("auto_home_on_stop") == "true",
+                    "auto_home_delay_s": cfg["teleop"]["auto_home_delay_s"],
                 }
             ],
         ),
@@ -133,14 +187,35 @@ def generate_launch_description():
         [
             DeclareLaunchArgument("config", default_value=str(ROOT / "config/collection.yaml")),
             DeclareLaunchArgument("can_port", default_value="can0"),
+            DeclareLaunchArgument("verbose", default_value="false", choices=["true", "false"],
+                                  description="显示全部节点输出；默认仅显示采集状态、回零和警告/错误"),
+            DeclareLaunchArgument(
+                "teleop_only", default_value="false", choices=["true", "false"],
+                description="只运行遥操，不启动相机、触觉或录制",
+            ),
             DeclareLaunchArgument("auto_enable", default_value="true", choices=["true", "false"]),
             DeclareLaunchArgument("quest_input", default_value="true", choices=["true", "false"]),
-            DeclareLaunchArgument("fast_mode", default_value="false", choices=["false", "true"]),
             DeclareLaunchArgument(
-                "auto_home_on_stop", default_value="false", choices=["true", "false"]
+                "coordinate_mode", default_value="", choices=["", "relative", "world"],
+                description="relative 保留原有相对坐标；world 使用 Quest LOCAL 世界坐标并锁定基座方向",
             ),
-            DeclareLaunchArgument("speed_percent", default_value="5"),
-            DeclareLaunchArgument("home_speed_percent", default_value="5"),
+            DeclareLaunchArgument("fast_mode", default_value="", choices=["", "false", "true"]),
+            DeclareLaunchArgument(
+                "auto_home_on_stop", default_value="", choices=["", "true", "false"]
+            ),
+            DeclareLaunchArgument("speed_percent", default_value=""),
+            DeclareLaunchArgument("home_speed_percent", default_value=""),
+            DeclareLaunchArgument(
+                "delta_frame", default_value="", choices=["", "base", "tcp"],
+                description="base 按基座方向映射；tcp 复现 QuestArmTeleop 的局部增量",
+            ),
+            *[
+                DeclareLaunchArgument(
+                    "ros_to_arm_" + axis, default_value="",
+                    description="手柄坐标修正（rad）；留空使用 collection.yaml，与 QuestArmTeleop 参数同名",
+                )
+                for axis in ("roll", "pitch", "yaw")
+            ],
             OpaqueFunction(function=_launch),
         ]
     )

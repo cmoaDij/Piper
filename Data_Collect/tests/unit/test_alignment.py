@@ -1,8 +1,17 @@
 import numpy as np
 import pytest
 
-from data_collect.dataset.alignment import action_indices, causal_indices
+from data_collect.dataset.alignment import action_indices, causal_indices, segment_indices
 from data_collect.calibration.latency import image_indices
+
+
+def test_action_matching_cannot_bridge_a_pause_even_when_old_target_is_closer():
+    indices, held = segment_indices(action_indices, [100, 130], [115, 125],
+                                    [0, 1], [0, 1], half_window_ns=25)
+    np.testing.assert_array_equal(indices, [0, 1])
+    assert not held.any()
+    with pytest.raises(ValueError, match="缺少有效样本"):
+        segment_indices(causal_indices, [100], [125], [0], [1])
 
 
 def test_observations_use_only_past_valid_frames():
